@@ -176,10 +176,11 @@
     
 
 
+    <xacro:property name="imu_height" value="0.02"/>
     <joint name="imu_joint" type="fixed">
         <parent link="chassis"/>
         <child link="imu"/>
-        <origin xyz="0 0 ${slab_height}"/>
+        <origin xyz="0.075 0 ${slab_height+imu_height}"/>
     </joint>
         
     <link name="imu"></link>
@@ -196,7 +197,7 @@
     <xacro:insert_camera
         base_name="camera" 
         parent_name="chassis" 
-        x="0.13" y="0" z="${chassis_height+0.015}"
+        x="0.11" y="0" z="${chassis_height+0.015}"
         mass="0.005" tilt_angle="0.00"/>     
     
 </robot>
