@@ -181,8 +181,8 @@ def generate_launch_description():
         output='screen',
         condition=IfCondition(use_lidar),
         parameters=[{'scan_topic': 'scan',
-                    'min_angle_deg': -150.0,
-                    'max_angle_deg': 150.0}
+                    'min_angle_deg': -180.0,
+                    'max_angle_deg': 180.0}
                     ],
         remappings=[("filtered_scan", "lidar/scan")]
     )
