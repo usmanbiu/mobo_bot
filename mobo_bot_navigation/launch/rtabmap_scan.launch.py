@@ -22,14 +22,14 @@ from launch.conditions import IfCondition, UnlessCondition
 from launch_ros.actions import Node
 
 def launch_setup(context, *args, **kwargs):
-    use_sim_time = False #LaunchConfiguration('use_sim_time')
+    use_sim_time = True #LaunchConfiguration('use_sim_time') 
     localization = LaunchConfiguration('localization').perform(context)
     localization = localization == 'True' or localization == 'true'
     icp_odometry = False #LaunchConfiguration('icp_odometry').perform(context)
     icp_odometry = icp_odometry == 'True' or icp_odometry == 'true'
     
     parameters={
-          'frame_id':'base_footprint',
+          'frame_id':'base_link',
           'use_sim_time':use_sim_time,
           'subscribe_depth':False,
           'subscribe_rgb':True,
@@ -50,9 +50,9 @@ def launch_setup(context, *args, **kwargs):
         arguments.append('-d') # This will delete the previous database (~/.ros/rtabmap.db)
                
     remappings=[
-          ('scan', '/scan'),
-          ('rgb/image','/camera/image_raw'), 
-          ('rgb/camera_info','/camera/camera_info')]
+          ('scan','/lidar/scan'),
+          ('rgb/image','/camera_optical/image_raw'), 
+          ('rgb/camera_info','/camera_optical/camera_info')]
     if icp_odometry:
         remappings.append(('odom', 'icp_odom'))
     

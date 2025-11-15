@@ -28,7 +28,7 @@ def launch_setup(context, *args, **kwargs):
     # Directories
     pkg_nav2_bringup = get_package_share_directory(
         'nav2_bringup')
-    pkg_rtabmap_demos = get_package_share_directory(
+    pkg_navigation = get_package_share_directory(
         'mobo_bot_navigation')
     
     world_name = LaunchConfiguration('world').perform(context)
@@ -38,7 +38,7 @@ def launch_setup(context, *args, **kwargs):
     if icp_odometry:
         # modified nav2 params to use icp_odom instead odom frame
         nav2_params_file = PathJoinSubstitution(
-            [FindPackageShare('rtabmap_demos'), 'params', 'turtlebot3_scan_nav2_params.yaml']
+            [FindPackageShare('mobo_bot_navigation'), 'config', 'turtlebot3_scan_nav2_params.yaml']
         )
     else:
         # original nav2 params
@@ -52,7 +52,7 @@ def launch_setup(context, *args, **kwargs):
     rviz_launch = PathJoinSubstitution(
         [pkg_nav2_bringup, 'launch', 'rviz_launch.py'])
     rtabmap_launch = PathJoinSubstitution(
-        [pkg_rtabmap_demos, 'launch', 'rtabmap_scan.launch.py'])
+        [pkg_navigation, 'launch', 'rtabmap_scan.launch.py'])
 
     # To use ICP odometry, we should increase clock rate of gazebo, we copied content of
     # turtlebot3_gazebo/launch/turtlebot3_world.launch here
