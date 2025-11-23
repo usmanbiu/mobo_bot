@@ -14,6 +14,7 @@ from launch.conditions import IfCondition, UnlessCondition
 def generate_launch_description():
     # delare any path variable
     description_pkg_path = get_package_share_directory('mobo_bot_description')
+    usb_cam_pkg_path = get_package_share_directory('usb_cam') 
     base_pkg_path = get_package_share_directory('mobo_bot_base')
 
     eimu_config_file = os.path.join(base_pkg_path,'config','eimu_params.yaml')
@@ -218,6 +219,10 @@ def generate_launch_description():
         condition=IfCondition(use_camera),
     )
 
+    usb_cam_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource([os.path.join(usb_cam_pkg_path,'launch','camera.launch.py')]) 
+        )
+
     #--------------------------------------------------------------------------
 
 
@@ -255,7 +260,8 @@ def generate_launch_description():
     ld.add_action(start_rp_lidar_c1_node_after_diff_drive_controller_spawner)
     ld.add_action(start_rp_lidar_c1_node_after_diff_drive_controller_spawner_no_ekf)
     ld.add_action(lidar_angle_filter_node)
-    ld.add_action(camera_node)
+    #ld.add_action(camera_node)
+    ld.add_action(usb_cam_launch)
     ld.add_action(twist_mux_node)
 
     return ld      # return (i.e send) the launch description for excecution

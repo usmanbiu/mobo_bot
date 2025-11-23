@@ -22,7 +22,7 @@ from launch.conditions import IfCondition, UnlessCondition
 from launch_ros.actions import Node
 
 def launch_setup(context, *args, **kwargs):
-    use_sim_time = True #LaunchConfiguration('use_sim_time') 
+    use_sim_time = False #LaunchConfiguration('use_sim_time') 
     localization = LaunchConfiguration('localization').perform(context)
     localization = localization == 'True' or localization == 'true'
     icp_odometry = False #LaunchConfiguration('icp_odometry').perform(context)
@@ -49,15 +49,26 @@ def launch_setup(context, *args, **kwargs):
     else:
         arguments.append('-d') # This will delete the previous database (~/.ros/rtabmap.db)
                
+                #change to /camera_optical/image_converted if your camera supports a
+               #rtabmap acceptable format by default, works with the camera converter node below, also
+               #comment out that node
     remappings=[
           ('scan','/lidar/scan'),
-          ('rgb/image','/camera_optical/image_raw'), 
-          ('rgb/camera_info','/camera_optical/camera_info')]
+          ('rgb/image','/camera_optical/image_converted'), 
+          ('rgb/camera_info','/camera_optical/camera_info')] 
     if icp_odometry:
         remappings.append(('odom', 'icp_odom'))
     
     return [
         # Nodes to launch
+        #used this node to convert from YUYV format to bgr8, comment this node if your camera supports bgr8 
+        # or an rtabmap acceptable format by default
+        Node(
+            package='camera_converter',
+            executable='cam_formater',
+            #name='camera_format_converter',
+            output='screen'
+        ),
         
         # ICP odometry (optional)
         Node(
