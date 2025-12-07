@@ -13,10 +13,9 @@
   <test_depend>python3-pytest</test_depend>
 
   <depend>rclpy</depend>
-  <depend>sensors_msgs</depend>
+  <depend>sensor_msgs</depend>
   <depend>cv_bridge</depend>
-  <depend>cv2</depend>
-  <depend>numpy</depend>
+  <depend>python3-numpy</depend>
 
   <export>
     <build_type>ament_python</build_type>
