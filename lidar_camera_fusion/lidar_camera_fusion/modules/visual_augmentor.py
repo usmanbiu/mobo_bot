@@ -1,22 +1,17 @@
-
-#working version with second pattern, adaptive intensity normalization, and landmark confirmation logic.
+#normaliized all intensity for each scan before applying threshold, and use normalized intensity for each scan to better spread out the values for your specific environment. This way, even if your intensities are clustered in a narrow range (e.g., 35-44), they will be mapped across the full 0-1 range for more effective thresholding and visualization.
 
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, LaserScan, CameraInfo
-from geometry_msgs.msg import PointStamped, TransformStamped
+from geometry_msgs.msg import PointStamped
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
 import tf2_ros
 from tf2_geometry_msgs import do_transform_point
-#from tf_transformations import quaternion_matrix
-#from scipy.spatial.transform import Rotation
 import hashlib
 from message_filters import ApproximateTimeSynchronizer, Subscriber
-#import time
-#from collections import OrderedDict
 import os
 from datetime import datetime
 
@@ -82,7 +77,7 @@ class VisualAugmentor(Node):
         self.observed_min_intensity = float('inf')
         self.observed_max_intensity = float('-inf')
         self.intensity_samples = []  # Store recent intensity samples for adaptive mapping
-        self.max_samples = 1000  # Keep last 1000 samples
+        self.max_samples = 500  # Keep last 1000 samples
         # =====================================================
 
         #map frame
@@ -106,8 +101,12 @@ class VisualAugmentor(Node):
             'TAG36H11'    # Family 3: Largest, most complex (36x36 grid, 11 bits)
         ]
         
+        # Marker parameters
+        self.marker_size = 40  # pixels
+        self.marker_opacity = 0.7  # Blend with original image
+
         # For each family, we'll generate multiple tag IDs (0-9) for variety
-        self.tags_per_family = 10  # IDs 0-9 available for each family  # each family has 10 tag ids that are accessed using cluster size
+        self.tags_per_family = 4  # IDs 0-9 available for each family  # each family has 10 tag ids that are accessed using cluster size
         
         # Cache for pre-generated AprilTag patterns
         self.april_tag_cache = {}
@@ -115,13 +114,10 @@ class VisualAugmentor(Node):
         # ============================================
         
         # CRITICAL: Intensity parameters for 0-255 range (but typically <50)
-        self.reflectivity_threshold = 20  # Absolute threshold in 0-255 range
+        self.reflectivity_threshold = 0.6  # Absolute threshold in 0-255 range
         self.relative_threshold_multiplier = 1.2  # Times max intensity in scan
         self.min_cluster_size = 3  # Minimum points to form a landmark
         
-        # Marker parameters
-        self.marker_size = 40  # pixels
-        self.marker_opacity = 0.7  # Blend with original image
         
         # ========== LANDMARK LIFECYCLE MANAGEMENT ==========
         # Store confirmed and candidate landmarks
@@ -162,46 +158,7 @@ class VisualAugmentor(Node):
                               f"{self.relative_threshold_multiplier}x max (relative)")
         self.get_logger().info(f"Time synchronizer active: slop=0.1s, queue_size=10")
         self.get_logger().info(f"Intensity mapping log file: {self.log_file_path}")
-    
-    def update_intensity_range(self, intensity_value):
-        """Update observed min/max intensity values and maintain sample history."""
-        if intensity_value < self.observed_min_intensity:
-            self.observed_min_intensity = intensity_value
-            self.get_logger().info(f"New min intensity observed: {self.observed_min_intensity:.2f}")
-        
-        if intensity_value > self.observed_max_intensity:
-            self.observed_max_intensity = intensity_value
-            self.get_logger().info(f"New max intensity observed: {self.observed_max_intensity:.2f}")
-        
-        # Add to samples list
-        self.intensity_samples.append(intensity_value)
-        if len(self.intensity_samples) > self.max_samples:
-            self.intensity_samples.pop(0)
-    
-    def get_adaptive_normalized_intensity(self, intensity_value):
-        """
-        Normalize intensity based on observed range rather than global 0-255.
-        This spreads your actual intensity values (35-44) across the full 0-1 range.
-        """
-        self.update_intensity_range(intensity_value)
-        
-        # If we have enough samples, use observed range for normalization
-        if len(self.intensity_samples) > 10 and self.observed_max_intensity > self.observed_min_intensity:
-            # Add a small buffer to avoid edge cases
-            min_val = max(0, self.observed_min_intensity - 2)
-            max_val = min(255, self.observed_max_intensity + 2)
-            
-            # Normalize within observed range
-            normalized = (intensity_value - min_val) / (max_val - min_val)
-            # Clamp to 0-1
-            normalized = np.clip(normalized, 0.0, 1.0)
-            
-            self.get_logger().debug(f"Adaptive norm: {intensity_value:.2f} -> {normalized:.4f} "
-                                    f"(range: {min_val:.2f}-{max_val:.2f})")
-            return normalized
-        else:
-            # Fall back to global normalization
-            return intensity_value / 255.0
+      
     
     def create_log_file(self):
         """Create a unique log file with timestamp."""
@@ -221,12 +178,12 @@ class VisualAugmentor(Node):
         """Write header to the log file."""
         try:
             with open(self.log_file_path, 'w') as f:
-                f.write("timestamp,intensity_raw,intensity_normalized_global,intensity_normalized_adaptive,intensity_idx,quarter,family,cluster_size,x_position,y_position,marker_id,observed_min,observed_max\n")
+                f.write("timestamp,intensity_raw,intensity_normalized,intensity_idx,quarter,family,cluster_size,x_position,y_position,marker_id,observed_min,observed_max\n")
             self.get_logger().info(f"Created log file: {self.log_file_path}")
         except Exception as e:
             self.get_logger().error(f"Failed to create log file: {e}")
     
-    def log_intensity_mapping(self, landmark, intensity_idx, quarter, family, marker_id, normalized_adaptive):
+    def log_intensity_mapping(self, landmark, intensity_idx, quarter, family, marker_id, intensity_normalized):
         """Log intensity mapping data to file."""
         try:
             self.mapping_counter += 1
@@ -241,7 +198,7 @@ class VisualAugmentor(Node):
                 f.write(f"{timestamp},"
                        f"{landmark['intensity']:.2f},"
                        f"{landmark['intensity_normalized']:.4f},"  # Global normalization
-                       f"{normalized_adaptive:.4f},"  # Adaptive normalization
+                       #f"{normalized_adaptive:.4f},"  # Adaptive normalization
                        f"{intensity_idx},"
                        f"{quarter},"
                        f"{family},"
@@ -535,7 +492,6 @@ class VisualAugmentor(Node):
             # Pass through original image on error
             self.pub_augmented.publish(image_msg)
         
-        
     def extract_high_reflectivity_landmarks(self, scan_msg):
         """
         Extract and cluster high reflectivity points from LaserScan.
@@ -555,48 +511,82 @@ class VisualAugmentor(Node):
         # Create angle array
         angles = scan_msg.angle_min + np.arange(len(ranges)) * scan_msg.angle_increment
         
-        # Filter valid points (range > 0 and finite intensity)
-        valid_mask = (ranges > scan_msg.range_min) & (ranges < scan_msg.range_max)
-        valid_mask &= np.isfinite(intensities)
-
-                
-        # In ROS LaserScan coordinates:
-        # 0 rad → forward
-        # +π/2 → left
-        # −π/2 → right
-        # ±π → directly behind
-        # Angle-based FOV filtering (±70 degrees), swap the negtive sign after rotating lidar
+        # ========== STEP 1: BASIC FILTERS (RANGE & FINITE) FOR NORMALIZATION ==========
+        # Filter out invalid range points and non-finite intensities
+        range_mask = (ranges > scan_msg.range_min) & (ranges < scan_msg.range_max)
+        finite_mask = np.isfinite(intensities)
+        valid_for_norm_mask = range_mask & finite_mask
         
-        forward_fov_mask = (angles >= -self.half_fov_rad) & (angles <= self.half_fov_rad)
-        valid_mask &= forward_fov_mask
-
-
-        valid_ranges = ranges[valid_mask]
-        valid_intensities = intensities[valid_mask]
-        valid_angles = angles[valid_mask]
+        # Get intensities for normalization (using full 360° data, no FOV filter yet)
+        intensities_all = intensities[valid_for_norm_mask]
         
-        if len(valid_ranges) == 0:
+        if len(intensities_all) == 0:
             return []
         
-        # Calculate dynamic threshold based on YOUR typical intensity range (<50)
-        max_intensity = np.max(valid_intensities)
-        min_intensity = np.min(valid_intensities)
+        # Calculate min/max from FULL 360° scan (or full sensor FOV)
+        min_intensity_full = np.min(intensities_all)
+        max_intensity_full = np.max(intensities_all)
+
+        self.observed_min_intensity = min_intensity_full
+        self.observed_max_intensity = max_intensity_full
         
-        # CRITICAL: Two-part threshold for your data:
-        # 1. Absolute threshold (e.g., >20 in 0-255 range)
-        # 2. Relative threshold (e.g., >2x median intensity)
-        median_intensity = np.median(valid_intensities)
+        # Normalize intensities using full range
+        if max_intensity_full > min_intensity_full:
+            # Create array of normalized intensities for all valid points
+            norm_intensities_full = (intensities_all - min_intensity_full) / (max_intensity_full - min_intensity_full)
+        else:
+            norm_intensities_full = np.zeros_like(intensities_all)
+        
+        self.get_logger().debug(
+            f"Full scan intensity range: {min_intensity_full:.2f} - {max_intensity_full:.2f}",
+            throttle_duration_sec=2.0
+        )
+        # ==============================================================================
+        
+        # ========== STEP 2: UPDATE SCAN-BASED INTENSITY RANGE ==========
+        # Update adaptive range using ALL valid intensities from this scan (full 360°)
+        #self.update_scan_intensity_range(norm_intensities_all)
+        # =================================================================
+        
+        # ========== STEP 3: APPLY FOV FILTER FOR PROCESSING ==========
+        # Now apply FOV filter to get only points in our region of interest
+        forward_fov_mask = (angles >= -self.half_fov_rad) & (angles <= self.half_fov_rad)
+        
+        # Combine with basic filters
+        final_mask = valid_for_norm_mask & forward_fov_mask
+        
+        # Extract filtered data (only points in our FOV)
+        valid_ranges = ranges[final_mask]
+        valid_intensities = intensities[final_mask]
+        valid_angles = angles[final_mask]
+        
+        # Get corresponding normalized intensities (need to map indices carefully)
+        # Create a mapping from filtered indices to normalized values
+        # Method: Get indices of valid_for_norm_mask, then filter by FOV
+        valid_norm_indices = np.where(valid_for_norm_mask)[0]
+        fov_filtered_indices = valid_norm_indices[forward_fov_mask[valid_for_norm_mask]]
+        
+        # Extract normalized intensities for FOV-filtered points
+        if len(fov_filtered_indices) > 0:
+            fov_norm_intensities = norm_intensities_full[forward_fov_mask[valid_for_norm_mask]]
+        else:
+            fov_norm_intensities = np.array([])
+        
+        if len(valid_ranges) == 0:
+            return []  
+        
+        median_fov_intensity = np.median(fov_norm_intensities)
         
         # Dynamic threshold calculation
         absolute_threshold = self.reflectivity_threshold
-        relative_threshold = median_intensity * self.relative_threshold_multiplier
+        relative_threshold = median_fov_intensity * self.relative_threshold_multiplier
         
         # Use whichever is higher to be conservative
         threshold = max(absolute_threshold, relative_threshold)
         
         self.get_logger().debug(
-            f"Intensity thresholds: max={max_intensity:.1f}, "
-            f"median={median_intensity:.1f}, "
+            f"Intensity thresholds: max={threshold:.1f}, "
+            f"median={median_fov_intensity:.1f}, "
             f"abs_thresh={absolute_threshold}, "
             f"rel_thresh={relative_threshold:.1f}, "
             f"final={threshold:.1f}",
@@ -604,11 +594,11 @@ class VisualAugmentor(Node):
         )
         
         # Find high reflectivity points
-        high_reflectivity_mask = valid_intensities > threshold
+        high_reflectivity_mask = fov_norm_intensities > threshold
         self.stats['high_reflectivity_points'] += np.sum(high_reflectivity_mask)
         
         high_ranges = valid_ranges[high_reflectivity_mask]
-        high_intensities = valid_intensities[high_reflectivity_mask]
+        high_intensities = fov_norm_intensities[high_reflectivity_mask] #valid_norm_intensities with fov
         high_angles = valid_angles[high_reflectivity_mask]
         
         if len(high_ranges) == 0:
@@ -643,16 +633,7 @@ class VisualAugmentor(Node):
                 cluster_y = np.mean(y[cluster_mask])
                 cluster_z = np.mean(z[cluster_mask])
                 cluster_intensity = np.mean(high_intensities[cluster_mask])
-                
-                # Normalize intensity using global method (kept for backward compatibility)
-                intensity_norm_global = (
-                    (cluster_intensity - self.GLOBAL_MIN_INTENSITY) /
-                    (self.GLOBAL_MAX_INTENSITY - self.GLOBAL_MIN_INTENSITY)
-                )
-                intensity_normalized_global = np.clip(intensity_norm_global, 0.0, 1.0)
-                
-                # Also get adaptive normalization for logging and potential future use
-                intensity_normalized_adaptive = self.get_adaptive_normalized_intensity(cluster_intensity)
+
 
                 #get lidar to map transform
                 transform_l_m = self.tf_buffer.lookup_transform(
@@ -683,8 +664,8 @@ class VisualAugmentor(Node):
                     'y': Y,
                     'z': Z,
                     'intensity': float(cluster_intensity),  # Original 0-255
-                    'intensity_normalized': float(intensity_normalized_global),  # Global normalized 0-1
-                    'intensity_normalized_adaptive': float(intensity_normalized_adaptive),  # Adaptive normalized
+                    'intensity_normalized': float(cluster_intensity),  # Global normalized 0-1
+                    #'intensity_normalized_adaptive': float(intensity_normalized_adaptive),  # Adaptive normalized
                     'cluster_size': int(cluster_size),
                     'distance': float(distance),
                     'raw_points': list(zip(x[cluster_mask], y[cluster_mask]))
@@ -814,101 +795,6 @@ class VisualAugmentor(Node):
             self.get_logger().warn(f"AprilTag generation failed: {e}")
             self.get_logger().warn("Falling back to fallback pattern generator")
     
-    # def generate_single_april_tag(self, family, tag_id):
-    #     """
-    #     Generate a single AprilTag pattern.
-        
-    #     This is a robust implementation that creates standard AprilTag-compatible
-    #     patterns using OpenCV drawing primitives. It follows the standard AprilTag
-    #     structure: outer black border, inner white border, and encoded pattern.
-        
-    #     Args:
-    #         family: String like 'TAG16H5', 'TAG25H7', 'TAG25H9', 'TAG36H11'
-    #         tag_id: Integer ID (0-9)
-            
-    #     Returns:
-    #         numpy array: BGR image of the AprilTag, or None if generation fails
-    #     """
-    #     try:
-    #         # Determine tag dimensions based on family
-    #         if family == 'TAG16H5':
-    #             grid_size = 16  # 16x16 grid
-    #             bits_per_axis = 4  # 4x4 bits (16 total)
-    #         elif family == 'TAG25H7':
-    #             grid_size = 25  # 25x25 grid
-    #             bits_per_axis = 5  # 5x5 bits (25 total)
-    #         elif family == 'TAG25H9':
-    #             grid_size = 25  # 25x25 grid
-    #             bits_per_axis = 5  # 5x5 bits (25 total)
-    #         elif family == 'TAG36H11':
-    #             grid_size = 36  # 36x36 grid
-    #             bits_per_axis = 6  # 6x6 bits (36 total)
-    #         else:
-    #             self.get_logger().error(f"Unknown AprilTag family: {family}")
-    #             return None
-            
-    #         # Scale factor to make tag visible at our marker size
-    #         # We want the tag grid to occupy most of the marker area
-    #         cell_size = max(1, self.marker_size // (grid_size + 4))  # +4 for borders
-    #         tag_pixels = grid_size * cell_size
-    #         total_size = tag_pixels + 4 * cell_size  # Add border margins
-            
-    #         # Create blank image (white background)
-    #         tag_img = np.ones((total_size, total_size, 3), dtype=np.uint8) * 255
-            
-    #         # Draw outer black border (standard AprilTag has thick black border)
-    #         border_thickness = cell_size
-    #         cv2.rectangle(tag_img, 
-    #                      (0, 0), 
-    #                      (total_size-1, total_size-1), 
-    #                      (0, 0, 0), 
-    #                      border_thickness)
-            
-    #         # Draw inner white border (creates contrast)
-    #         inner_margin = border_thickness
-    #         cv2.rectangle(tag_img, 
-    #                      (inner_margin, inner_margin), 
-    #                      (total_size-inner_margin-1, total_size-inner_margin-1), 
-    #                      (255, 255, 255), 
-    #                      border_thickness)
-            
-    #         # Generate the payload pattern based on tag_id
-    #         # This creates a deterministic but unique pattern for each ID
-    #         pattern_bits = self.generate_pattern_bits(tag_id, bits_per_axis)
-            
-    #         # Draw the payload (inner grid)
-    #         payload_start = 2 * cell_size
-    #         for row in range(bits_per_axis):
-    #             for col in range(bits_per_axis):
-    #                 # Calculate cell position
-    #                 x1 = payload_start + col * cell_size
-    #                 y1 = payload_start + row * cell_size
-    #                 x2 = x1 + cell_size
-    #                 y2 = y1 + cell_size
-                    
-    #                 # Color based on bit value (0=black, 1=white)
-    #                 if pattern_bits[row][col] == 0:
-    #                     color = (0, 0, 0)  # Black
-    #                 else:
-    #                     color = (255, 255, 255)  # White
-                    
-    #                 # Draw filled cell
-    #                 cv2.rectangle(tag_img, (x1, y1), (x2, y2), color, -1)
-            
-    #         # Add subtle noise to make it more "realistic" and aid detection
-    #         # (AprilTag detectors expect some imperfection)
-    #         noise = np.random.normal(0, 2, tag_img.shape).astype(np.int16)
-    #         tag_img = np.clip(tag_img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
-            
-    #         # Resize to exactly marker_size x marker_size
-    #         final_tag = cv2.resize(tag_img, (self.marker_size, self.marker_size), 
-    #                               interpolation=cv2.INTER_LINEAR)
-            
-    #         return final_tag
-            
-    #     except Exception as e:
-    #         self.get_logger().error(f"Failed to generate AprilTag {family} ID:{tag_id}: {e}")
-    #         return None
 
     def generate_single_april_tag(self, family, tag_id):
         """
@@ -1007,63 +893,6 @@ class VisualAugmentor(Node):
             )
             return None
         
-
-
-    # def generate_pattern_bits(self, tag_id, bits_per_axis):
-    #     """
-    #     Generate a deterministic binary pattern for the AprilTag payload.
-        
-    #     This creates a unique pattern for each tag_id that follows AprilTag's
-    #     requirement for balanced black/white and good corner features.
-        
-    #     Args:
-    #         tag_id: Integer ID (0-9)
-    #         bits_per_axis: Size of grid (4, 5, or 6)
-            
-    #     Returns:
-    #         2D list of 0/1 values
-    #     """
-    #     # Use seed for deterministic but varied patterns
-    #     seed = tag_id * 1000
-    #     np.random.seed(seed)
-        
-    #     # Create base pattern
-    #     pattern = np.zeros((bits_per_axis, bits_per_axis), dtype=int)
-        
-    #     # Fill with deterministic pattern based on tag_id
-    #     # This creates a balanced pattern with good corner features
-        
-    #     # Method 1: Use binary representation of tag_id
-    #     binary = format(tag_id, f'0{bits_per_axis*bits_per_axis}b')
-        
-    #     if len(binary) >= bits_per_axis * bits_per_axis:
-    #         # Fill row-major from binary string
-    #         idx = 0
-    #         for row in range(bits_per_axis):
-    #             for col in range(bits_per_axis):
-    #                 if idx < len(binary):
-    #                     pattern[row][col] = int(binary[idx])
-    #                     idx += 1
-    #     else:
-    #         # Method 2: Use combination of row/col parity and tag_id
-    #         for row in range(bits_per_axis):
-    #             for col in range(bits_per_axis):
-    #                 # XOR of row, col, and tag_id bits creates unique pattern
-    #                 val = (row ^ col ^ tag_id) % 2
-    #                 # Flip some bits based on position for more variety
-    #                 if (row * col) % 3 == 0:
-    #                     val = 1 - val
-    #                 pattern[row][col] = val
-        
-    #     # Ensure we have both black and white (not all same)
-    #     if np.all(pattern == pattern[0, 0]):
-    #         # Fix by flipping alternating cells
-    #         for row in range(bits_per_axis):
-    #             for col in range(bits_per_axis):
-    #                 if (row + col) % 2 == 0:
-    #                     pattern[row][col] = 1 - pattern[row][col]
-        
-    #     return pattern
     
     def get_fallback_pattern(self, intensity_quarter):
         """
@@ -1125,11 +954,11 @@ class VisualAugmentor(Node):
         
         # Use ADAPTIVE normalization for intensity mapping
         # This will spread your actual intensity range across all quarters
-        if 'intensity_normalized_adaptive' in landmark:
-            intensity_norm = landmark['intensity_normalized_adaptive']
+        if 'intensity_normalized' in landmark:
+            intensity_norm = landmark['intensity_normalized']  #originally intensity_normalized_adaptive, but we are using norm intensity from start in landmark.intensity see line 760ish
         else:
-            # Fallback to global if adaptive not available
-            intensity_norm = landmark['intensity_normalized']
+            # Fallback to intensity if adaptive not available (now normalized with recent changes)
+            intensity_norm = landmark['intensity']
         
         # Quantize intensity to 0-9 scale
         intensity_idx = min(9, int(intensity_norm * 10))
@@ -1195,8 +1024,8 @@ class VisualAugmentor(Node):
                     # ========== LOG THE INTENSITY MAPPING ==========
                     if landmark is not None:
                         # Get adaptive normalized value for logging
-                        adaptive_norm = landmark.get('intensity_normalized_adaptive', landmark['intensity_normalized'])
-                        self.log_intensity_mapping(landmark, intensity_idx, quarter, family, marker_id, adaptive_norm)
+                        intensity_normalized = landmark.get('intensity_normalized', landmark['intensity_normalized'])
+                        self.log_intensity_mapping(landmark, intensity_idx, quarter, family, marker_id, intensity_normalized)
                     # ================================================
                     
                 except Exception as e:
