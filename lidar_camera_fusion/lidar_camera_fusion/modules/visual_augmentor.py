@@ -1,5 +1,5 @@
 
-#working version with second pattern row
+#working version with second pattern, adaptive intensity normalization, and landmark confirmation logic.
 
 #!/usr/bin/env python3
 import rclpy
