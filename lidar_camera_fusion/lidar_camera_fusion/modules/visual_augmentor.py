@@ -1,4 +1,5 @@
-#augmentor with time sync
+
+#working version with second pattern row
 
 #!/usr/bin/env python3
 import rclpy
@@ -10,33 +11,26 @@ import cv2
 import numpy as np
 import tf2_ros
 from tf2_geometry_msgs import do_transform_point
-from tf_transformations import quaternion_matrix
-from scipy.spatial.transform import Rotation
+#from tf_transformations import quaternion_matrix
+#from scipy.spatial.transform import Rotation
 import hashlib
 from message_filters import ApproximateTimeSynchronizer, Subscriber
-
+#import time
+#from collections import OrderedDict
+import os
+from datetime import datetime
 
 
 
 class VisualAugmentor(Node):
     """
-    Augments camera images with synthetic markers at reflectivity landmark locations.
-    Processes LaserScan directly to extract high-reflectivity landmarks.
-    
-    IMPORTANT: Lidar intensities are 0-255, but typically <50 in your environment.
-    We normalize to 0-1 for consistent processing.
+    Augments camera images with synthetic AprilTag markers at reflectivity landmark locations.
+    Uses 4 distinct AprilTag families based on normalized intensity values.
     """
     
     def __init__(self):
         super().__init__('visual_augmentor')
 
-        # # Get the parameter that's already declared by the base class
-        # use_sim_time = self.get_parameter('use_sim_time').value
-        
-        # # Set the parameter (still needed to actually enable sim time mode)
-        # self.set_parameters([rclpy.Parameter('use_sim_time', 
-        #                     rclpy.Parameter.Type.BOOL, use_sim_time)])
-                
         # Enable ALL debug logging
         self.get_logger().set_level(rclpy.logging.LoggingSeverity.DEBUG)
 
@@ -83,9 +77,17 @@ class VisualAugmentor(Node):
         self.GLOBAL_MIN_INTENSITY = 0.0
         self.GLOBAL_MAX_INTENSITY = 255.0  # based on sensor spec
 
+        # ========== DYNAMIC INTENSITY NORMALIZATION ==========
+        # Track observed intensity range for better normalization
+        self.observed_min_intensity = float('inf')
+        self.observed_max_intensity = float('-inf')
+        self.intensity_samples = []  # Store recent intensity samples for adaptive mapping
+        self.max_samples = 1000  # Keep last 1000 samples
+        # =====================================================
+
         #map frame
         self.map_frame = 'map'
-
+  
         #lidar field of view
         fov_deg = 140.0
         self.half_fov_rad = np.deg2rad(fov_deg / 2.0)  # ≈ 1.2217 rad
@@ -94,6 +96,23 @@ class VisualAugmentor(Node):
         self.marker_db = {}  # Stores marker patterns for consistency
         self.latest_image = None  # Store latest image for sync processing
         self.latest_image_header = None
+        
+        # ========== APRILTAG CONFIGURATION ==========
+        # Define the 4 AprilTag families we'll use (ordered by increasing complexity)
+        self.april_tag_families = [
+            'TAG16H5',    # Family 0: Smallest, simplest (16x16 grid, 5 bits)
+            'TAG25H7',    # Family 1: Medium-small (25x25 grid, 7 bits)
+            'TAG25H9',    # Family 2: Medium-large (25x25 grid, 9 bits)  
+            'TAG36H11'    # Family 3: Largest, most complex (36x36 grid, 11 bits)
+        ]
+        
+        # For each family, we'll generate multiple tag IDs (0-9) for variety
+        self.tags_per_family = 10  # IDs 0-9 available for each family  # each family has 10 tag ids that are accessed using cluster size
+        
+        # Cache for pre-generated AprilTag patterns
+        self.april_tag_cache = {}
+        self.pre_generate_april_tags()
+        # ============================================
         
         # CRITICAL: Intensity parameters for 0-255 range (but typically <50)
         self.reflectivity_threshold = 20  # Absolute threshold in 0-255 range
@@ -104,21 +123,136 @@ class VisualAugmentor(Node):
         self.marker_size = 40  # pixels
         self.marker_opacity = 0.7  # Blend with original image
         
-        # Statistics for debugging
+        # ========== LANDMARK LIFECYCLE MANAGEMENT ==========
+        # Store confirmed and candidate landmarks
+        self.landmarks = {}  # Dictionary of all tracked landmarks by ID
+        self.current_scan_landmarks = []  # Landmarks from current scan (candidates)
+        
+        # Confirmation parameters
+        self.required_observations = 10  # N = 10 observations needed for confirmation
+        self.spatial_consistency_threshold = 0.2  # meters - max distance for same landmark
+        self.max_landmark_age = 5.0  # seconds - remove landmarks not seen for this long
+        
+        # Statistics for confirmation tracking
         self.stats = {
             'scans_processed': 0,
             'total_points': 0,
             'high_reflectivity_points': 0,
             'landmarks_created': 0,
+            'landmarks_confirmed': 0,
+            'landmarks_expired': 0,
             'sync_calls': 0,
             'sync_skipped_no_calib': 0,
-            'sync_skipped_no_landmarks': 0
+            'sync_skipped_no_landmarks': 0,
+            'sync_skipped_no_confirmed': 0
         }
+        # ===================================================
         
-        self.get_logger().info("Visual Augmentor Initialized for 0-255 intensity range")
+        # ========== INTENSITY MAPPING LOGGING ==========
+        self.log_file_path = self.create_log_file()
+        self.log_intensity_mapping_header()
+        self.mapping_counter = 0
+        self.log_interval = 1  # Log every landmark (set to 1 to log all)
+        # ================================================
+        
+        self.get_logger().info("Visual Augmentor Initialized with AprilTag Landmark Markers")
+        self.get_logger().info(f"Using 4 AprilTag families: {', '.join(self.april_tag_families)}")
+        self.get_logger().info(f"Confirmation requires: {self.required_observations} observations within {self.spatial_consistency_threshold}m")
         self.get_logger().info(f"Threshold: {self.reflectivity_threshold} (absolute), "
                               f"{self.relative_threshold_multiplier}x max (relative)")
         self.get_logger().info(f"Time synchronizer active: slop=0.1s, queue_size=10")
+        self.get_logger().info(f"Intensity mapping log file: {self.log_file_path}")
+    
+    def update_intensity_range(self, intensity_value):
+        """Update observed min/max intensity values and maintain sample history."""
+        if intensity_value < self.observed_min_intensity:
+            self.observed_min_intensity = intensity_value
+            self.get_logger().info(f"New min intensity observed: {self.observed_min_intensity:.2f}")
+        
+        if intensity_value > self.observed_max_intensity:
+            self.observed_max_intensity = intensity_value
+            self.get_logger().info(f"New max intensity observed: {self.observed_max_intensity:.2f}")
+        
+        # Add to samples list
+        self.intensity_samples.append(intensity_value)
+        if len(self.intensity_samples) > self.max_samples:
+            self.intensity_samples.pop(0)
+    
+    def get_adaptive_normalized_intensity(self, intensity_value):
+        """
+        Normalize intensity based on observed range rather than global 0-255.
+        This spreads your actual intensity values (35-44) across the full 0-1 range.
+        """
+        self.update_intensity_range(intensity_value)
+        
+        # If we have enough samples, use observed range for normalization
+        if len(self.intensity_samples) > 10 and self.observed_max_intensity > self.observed_min_intensity:
+            # Add a small buffer to avoid edge cases
+            min_val = max(0, self.observed_min_intensity - 2)
+            max_val = min(255, self.observed_max_intensity + 2)
+            
+            # Normalize within observed range
+            normalized = (intensity_value - min_val) / (max_val - min_val)
+            # Clamp to 0-1
+            normalized = np.clip(normalized, 0.0, 1.0)
+            
+            self.get_logger().debug(f"Adaptive norm: {intensity_value:.2f} -> {normalized:.4f} "
+                                    f"(range: {min_val:.2f}-{max_val:.2f})")
+            return normalized
+        else:
+            # Fall back to global normalization
+            return intensity_value / 255.0
+    
+    def create_log_file(self):
+        """Create a unique log file with timestamp."""
+        # Create logs directory if it doesn't exist
+        log_dir = os.path.expanduser('~/april_tag_logs')
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+        
+        # Create filename with timestamp
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"intensity_mapping_{timestamp}.csv"
+        filepath = os.path.join(log_dir, filename)
+        
+        return filepath
+    
+    def log_intensity_mapping_header(self):
+        """Write header to the log file."""
+        try:
+            with open(self.log_file_path, 'w') as f:
+                f.write("timestamp,intensity_raw,intensity_normalized_global,intensity_normalized_adaptive,intensity_idx,quarter,family,cluster_size,x_position,y_position,marker_id,observed_min,observed_max\n")
+            self.get_logger().info(f"Created log file: {self.log_file_path}")
+        except Exception as e:
+            self.get_logger().error(f"Failed to create log file: {e}")
+    
+    def log_intensity_mapping(self, landmark, intensity_idx, quarter, family, marker_id, normalized_adaptive):
+        """Log intensity mapping data to file."""
+        try:
+            self.mapping_counter += 1
+            
+            # Only log every N landmarks to avoid excessive file size
+            if self.mapping_counter % self.log_interval != 0:
+                return
+            
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            
+            with open(self.log_file_path, 'a') as f:
+                f.write(f"{timestamp},"
+                       f"{landmark['intensity']:.2f},"
+                       f"{landmark['intensity_normalized']:.4f},"  # Global normalization
+                       f"{normalized_adaptive:.4f},"  # Adaptive normalization
+                       f"{intensity_idx},"
+                       f"{quarter},"
+                       f"{family},"
+                       f"{landmark.get('cluster_size', 0)},"
+                       f"{landmark.get('x', 0):.3f},"
+                       f"{landmark.get('y', 0):.3f},"
+                       f"{marker_id},"
+                       f"{self.observed_min_intensity if self.observed_min_intensity != float('inf') else 0:.2f},"
+                       f"{self.observed_max_intensity if self.observed_max_intensity != float('-inf') else 255:.2f}\n")
+        except Exception as e:
+            self.get_logger().error(f"Failed to write to log file: {e}")
     
     def camera_info_callback(self, msg):
         """Store camera calibration parameters and image dimensions."""
@@ -140,8 +274,15 @@ class VisualAugmentor(Node):
         self.latest_image = image_msg
         self.latest_image_header = image_msg.header
         
-        # Process scan to extract landmarks in map frame
-        landmarks = self.extract_high_reflectivity_landmarks(scan_msg)
+        # Process scan to extract landmarks in map frame (candidates for this scan)
+        self.current_scan_landmarks = self.extract_high_reflectivity_landmarks(scan_msg)
+        
+        # ========== UPDATE LANDMARK DATABASE WITH NEW OBSERVATIONS ==========
+        self.update_landmark_database()
+        # ====================================================================
+        
+        # Get ONLY confirmed landmarks for visualization
+        confirmed_landmarks = self.get_confirmed_landmarks()
         
         # Log sync stats periodically
         if self.stats['sync_calls'] % 10 == 0:
@@ -151,14 +292,130 @@ class VisualAugmentor(Node):
             )
             self.get_logger().info(
                 f"Sync #{self.stats['sync_calls']}: Time diff={time_diff:.3f}s, "
-                f"Landmarks={len(landmarks)}"
+                f"Candidates={len(self.current_scan_landmarks)}, "
+                f"Confirmed={len(confirmed_landmarks)}/{len(self.landmarks)}"
             )
         
-        # Process the synchronized pair
-        self.process_synchronized_data(image_msg, landmarks)
+        # Process the synchronized pair with ONLY confirmed landmarks
+        self.process_synchronized_data(image_msg, confirmed_landmarks)
+    
+    def update_landmark_database(self):
+        """
+        Update the persistent landmark database with new observations from current scan.
+        Implements confirmation logic requiring multiple consistent observations.
+        """
+        current_time = self.get_clock().now().nanoseconds / 1e9  # Convert to seconds
+        
+        # First, mark all existing landmarks as not seen in this scan
+        for landmark_id in self.landmarks:
+            self.landmarks[landmark_id]['seen_in_current_scan'] = False
+        
+        # Process each new candidate landmark from current scan
+        for candidate in self.current_scan_landmarks:
+            matched = False
+            
+            # Try to match with existing landmarks
+            for landmark_id, existing in self.landmarks.items():
+                # Calculate spatial distance
+                dx = candidate['x'] - existing['x_map']
+                dy = candidate['y'] - existing['y_map']
+                dz = candidate['z'] - existing['z_map']
+                distance = np.sqrt(dx*dx + dy*dy + dz*dz)
+                
+                # If within threshold, it's the same landmark
+                if distance < self.spatial_consistency_threshold:
+                    # Update existing landmark
+                    self.landmarks[landmark_id]['observation_count'] += 1
+                    self.landmarks[landmark_id]['last_seen'] = current_time
+                    self.landmarks[landmark_id]['seen_in_current_scan'] = True
+                    
+                    # Update position (running average for stability)
+                    alpha = 0.3  # Weight for new observation
+                    self.landmarks[landmark_id]['x_map'] = (1-alpha) * existing['x_map'] + alpha * candidate['x']
+                    self.landmarks[landmark_id]['y_map'] = (1-alpha) * existing['y_map'] + alpha * candidate['y']
+                    self.landmarks[landmark_id]['z_map'] = (1-alpha) * existing['z_map'] + alpha * candidate['z']
+                    
+                    # Update intensity (max tends to be most reliable)
+                    self.landmarks[landmark_id]['intensity'] = max(
+                        existing['intensity'], candidate['intensity']
+                    )
+                    self.landmarks[landmark_id]['intensity_normalized'] = max(
+                        existing['intensity_normalized'], candidate['intensity_normalized']
+                    )
+                    
+                    # Check if this observation pushes it to confirmed status
+                    if not existing['confirmed'] and self.landmarks[landmark_id]['observation_count'] >= self.required_observations:
+                        self.landmarks[landmark_id]['confirmed'] = True
+                        self.stats['landmarks_confirmed'] += 1
+                        self.get_logger().info(f"Landmark {landmark_id} CONFIRMED after {self.landmarks[landmark_id]['observation_count']} observations")
+                    
+                    matched = True
+                    break
+            
+            # If no match found, create new landmark entry
+            if not matched:
+                landmark_id = self.generate_landmark_id(candidate)
+                self.landmarks[landmark_id] = {
+                    'x_map': candidate['x'],
+                    'y_map': candidate['y'],
+                    'z_map': candidate['z'],
+                    'intensity': candidate['intensity'],
+                    'intensity_normalized': candidate['intensity_normalized'],
+                    'observation_count': 1,
+                    'first_seen': current_time,
+                    'last_seen': current_time,
+                    'confirmed': False,
+                    'seen_in_current_scan': True,
+                    'cluster_size': candidate['cluster_size']
+                }
+                self.stats['landmarks_created'] += 1
+                self.get_logger().debug(f"New candidate landmark: {landmark_id}")
+        
+        # Remove landmarks that haven't been seen for too long
+        expired_ids = []
+        for landmark_id, landmark in self.landmarks.items():
+            if current_time - landmark['last_seen'] > self.max_landmark_age:
+                expired_ids.append(landmark_id)
+        
+        for landmark_id in expired_ids:
+            if self.landmarks[landmark_id]['confirmed']:
+                self.get_logger().info(f"Confirmed landmark {landmark_id} expired (not seen for {self.max_landmark_age}s)")
+            del self.landmarks[landmark_id]
+            self.stats['landmarks_expired'] += 1
+    
+    def get_confirmed_landmarks(self):
+        """
+        Return list of all confirmed landmarks in the current format expected by process_synchronized_data.
+        """
+        confirmed_list = []
+        for landmark_id, landmark in self.landmarks.items():
+            if landmark['confirmed']:
+                # Convert to format expected by process_synchronized_data
+                confirmed_list.append({
+                    'x': landmark['x_map'],
+                    'y': landmark['y_map'],
+                    'z': landmark['z_map'],
+                    'intensity': landmark['intensity'],
+                    'intensity_normalized': landmark['intensity_normalized'],
+                    'cluster_size': landmark['cluster_size'],
+                    'observation_count': landmark['observation_count'],
+                    'landmark_id': landmark_id
+                })
+        return confirmed_list
+    
+    def generate_landmark_id(self, landmark):
+        """Generate a unique ID for a new landmark based on its position."""
+        # Quantize position to 10cm grid for stable IDs
+        grid_size = 0.1
+        x_idx = int(landmark['x'] / grid_size)
+        y_idx = int(landmark['y'] / grid_size)
+        z_idx = int(landmark['z'] / grid_size)
+        return f"lm_{x_idx}_{y_idx}_{z_idx}"
     
     def process_synchronized_data(self, image_msg, landmarks):
-        """Process time-synchronized image and landmarks."""
+        """
+        Process time-synchronized image and CONFIRMED landmarks only.
+        """
         if self.K is None:
             self.stats['sync_skipped_no_calib'] += 1
             self.get_logger().warn("No camera calibration yet, skipping augmentation")
@@ -170,32 +427,26 @@ class VisualAugmentor(Node):
             self.pub_augmented.publish(image_msg)
             return
         
+        # Count confirmed landmarks for stats
+        confirmed_count = len([l for l in self.landmarks.values() if l['confirmed']])
+        if confirmed_count == 0:
+            self.stats['sync_skipped_no_confirmed'] += 1
+            self.pub_augmented.publish(image_msg)
+            return
+        
         try:
             # Convert to OpenCV
             cv_image = self.bridge.imgmsg_to_cv2(image_msg, desired_encoding='bgr8')
             augmented = cv_image.copy()
             debug = cv_image.copy()
             
-            # Get transform from lidar to camera,# uncomment this part if using lidar to cam static transform (project_to image function)
-            # try:
-            #     tran = self.tf_buffer.lookup_transform(
-            #         self.camera_frame, self.lidar_frame,
-            #         image_msg.header.stamp,  # Use image timestamp for TF lookup
-            #         rclpy.duration.Duration(seconds=0.1))  # Timeout
-                
-            # except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
-            #         tf2_ros.ExtrapolationException) as e:
-            #     self.get_logger().warn(f"TF lookup failed: {e}")
-            #     self.pub_augmented.publish(image_msg)
-            #     return
-            
-            # Process each landmark (reusing your existing projection logic)
+            # Process each CONFIRMED landmark (only stable ones generate markers)
             markers_added = 0
             valid_landmarks = []
             
             for landmark in landmarks:
                 # Project landmark to image
-                uv = self.project_to_image(landmark) # uncomment this part if using lidar to cam static transform (anchor landmarks to lidar)-->, tran)
+                uv = self.project_to_image(landmark)
                 if uv is None:
                     continue
                 
@@ -210,7 +461,7 @@ class VisualAugmentor(Node):
                     })
             
             if not valid_landmarks:
-                self.get_logger().debug("No landmarks projected to image")
+                self.get_logger().debug("No confirmed landmarks projected to image")
                 self.pub_augmented.publish(image_msg)
                 return
             
@@ -226,15 +477,16 @@ class VisualAugmentor(Node):
                 landmark = data['landmark']
                 
                 # Create or retrieve marker
-                marker_pattern = self.get_marker_pattern(data['marker_id'])
+                marker_pattern = self.get_marker_pattern(data['marker_id'], landmark)
                 
                 # Blend marker onto image
                 self.blend_marker(augmented, u, v, marker_pattern)
                 
-                # Draw debug visualization with color based on intensity
+                # Draw debug visualization with confirmation info
                 intensity_norm = landmark['intensity_normalized']
                 color_intensity = int(intensity_norm * 255)
                 
+                # Confirmed landmarks get a special border
                 # Color gradient: blue (low) -> green (medium) -> red (high)
                 if intensity_norm < 0.33:
                     color = (255, int(color_intensity * 3), 0)  # Blue to cyan
@@ -243,8 +495,13 @@ class VisualAugmentor(Node):
                 else:
                     color = (0, 255 - int(color_intensity * 0.5), color_intensity)  # Green to red
                 
+                # Draw circle with double border for confirmed landmarks
                 cv2.circle(debug, (u, v), 8, color, 2)
-                cv2.putText(debug, f"{landmark['intensity']:.0f}", 
+                cv2.circle(debug, (u, v), 10, (255, 255, 255), 1)  # White outer ring for confirmed
+                
+                # Add observation count to debug text
+                obs_count = landmark.get('observation_count', self.required_observations)
+                cv2.putText(debug, f"{landmark['intensity']:.0f}({obs_count})", 
                            (u+10, v), cv2.FONT_HERSHEY_SIMPLEX, 
                            0.5, color, 1)
                 
@@ -257,8 +514,8 @@ class VisualAugmentor(Node):
             
             # Publish debug visualization with statistics
             debug_stats = (
-                f"Sync #{self.stats['sync_calls']}: {markers_added}/{len(valid_landmarks)} | "
-                f"Landmarks: {len(landmarks)}"
+                f"Sync #{self.stats['sync_calls']}: {markers_added}/{len(valid_landmarks)} confirmed | "
+                f"Total: {len(self.landmarks)} ({confirmed_count} confirmed)"
             )
             cv2.putText(debug, debug_stats, 
                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
@@ -269,7 +526,7 @@ class VisualAugmentor(Node):
             self.pub_debug.publish(debug_msg)
             
             self.get_logger().debug(
-                f"Added {markers_added} synthetic markers from {len(landmarks)} landmarks",
+                f"Added {markers_added} synthetic markers from {len(landmarks)} confirmed landmarks",
                 throttle_duration_sec=1.0
             )
             
@@ -277,7 +534,7 @@ class VisualAugmentor(Node):
             self.get_logger().error(f"Augmentation failed: {e}")
             # Pass through original image on error
             self.pub_augmented.publish(image_msg)
-    
+        
         
     def extract_high_reflectivity_landmarks(self, scan_msg):
         """
@@ -387,18 +644,16 @@ class VisualAugmentor(Node):
                 cluster_z = np.mean(z[cluster_mask])
                 cluster_intensity = np.mean(high_intensities[cluster_mask])
                 
-                # Normalize intensity to 0-1 for consistent processing
-                # Since max is typically <50, normalize to 0-100 scale
-                #intensity_normalized = min(cluster_intensity / 100.0, 1.0)
-             
-                intensity_norm = (
+                # Normalize intensity using global method (kept for backward compatibility)
+                intensity_norm_global = (
                     (cluster_intensity - self.GLOBAL_MIN_INTENSITY) /
                     (self.GLOBAL_MAX_INTENSITY - self.GLOBAL_MIN_INTENSITY)
                 )
+                intensity_normalized_global = np.clip(intensity_norm_global, 0.0, 1.0)
+                
+                # Also get adaptive normalization for logging and potential future use
+                intensity_normalized_adaptive = self.get_adaptive_normalized_intensity(cluster_intensity)
 
-                intensity_normalized = np.clip(intensity_norm, 0.0, 1.0)
-
-            
                 #get lidar to map transform
                 transform_l_m = self.tf_buffer.lookup_transform(
                 self.map_frame,  # target
@@ -428,7 +683,8 @@ class VisualAugmentor(Node):
                     'y': Y,
                     'z': Z,
                     'intensity': float(cluster_intensity),  # Original 0-255
-                    'intensity_normalized': float(intensity_normalized),  # Normalized 0-1
+                    'intensity_normalized': float(intensity_normalized_global),  # Global normalized 0-1
+                    'intensity_normalized_adaptive': float(intensity_normalized_adaptive),  # Adaptive normalized
                     'cluster_size': int(cluster_size),
                     'distance': float(distance),
                     'raw_points': list(zip(x[cluster_mask], y[cluster_mask]))
@@ -478,47 +734,6 @@ class VisualAugmentor(Node):
             Y = p_cam.point.y
             Z = p_cam.point.z
 
-
-                #  Alternative method using transform from Lidar to map directly
-            #  better to move thr transform_cam block to the top of script for efficency since its static
-            # transform_cam = self.tf_buffer.lookup_transform(
-            #     self.cam_frame,  # target
-            #     self.lidar_frame,   # source
-            #     rclpy.time.Time()
-            # )
-            #     t = transform_cam.transform.translation
-            #     q = transform_cam.transform.rotation
-
-                
-            #     translation = np.array([t.x, t.y, t.z])
-            #     quaternion_xyzw = np.array([q.x, q.y, q.z, q.w])
-                
-            #     self.get_logger().info(f"Translation from TF: [{translation[0]:.6f}, {translation[1]:.6f}, {translation[2]:.6f}]")
-            #     self.get_logger().info(f"Quaternion from TF: [{quaternion_xyzw[0]:.6f}, {quaternion_xyzw[1]:.6f}, {quaternion_xyzw[2]:.6f}, {quaternion_xyzw[3]:.6f}]")
-                
-            #    # Create rotation matrix
-            #     rotation = Rotation.from_quat(quaternion_xyzw)
-            #     R = rotation.as_matrix()
-            #     self.get_logger().warn(f"TF rot : {R}")
-            
-            #             # Build 4x4 transformation matrix
-            #     T = np.eye(4)
-            #     T[:3, :3] = R
-            #     T[:3, 3] = translation
-
-
-                    # Build point in LiDAR frame
-            # point_lidar = np.array([
-            #     landmark['x'],
-            #     landmark['y'],
-            #     landmark['z']
-            # ])
-
-            # point_lidar_h = np.append(point_lidar, 1.0)
-            # point_cam_h = T @ point_lidar_h
-            #X, Y, Z = point_cam_h[:3]
-
-            
 
             # Camera optical frame: Z forward
             self.get_logger().info(f"Z: {Z}")
@@ -570,127 +785,337 @@ class VisualAugmentor(Node):
             self.get_logger().warn(f"TF error during projection: {e}")
             return None
 
-
-    # use this functiont if using lidar to cam static transform to anchor landmarks to lidar
-    # def project_to_image(self, landmark, transform_lidar_to_camera):
-    #     """
-    #     Project a single LiDAR landmark into image pixel coordinates.
-    #     Uses the transform from the ROS message dynamically and camera intrinsics from self.K.
-    #     """
-        
-    #     # Check if camera intrinsics are available
-    #     if not hasattr(self, 'K') or self.K is None:
-    #         self.get_logger().error("Camera intrinsics (K matrix) not available yet. Waiting for camera_info message.")
-    #         return None
-        
-    #     if not hasattr(self, 'image_width') or not hasattr(self, 'image_height'):
-    #         self.get_logger().warn("Image dimensions not available, using defaults 640x480")
-    #         image_width = 640
-    #         image_height = 480
-    #     else:
-    #         image_width = self.image_width
-    #         image_height = self.image_height
-        
-    #     # Build point in LiDAR frame
-    #     point_lidar = np.array([
-    #         landmark['x'],
-    #         landmark['y'],
-    #         landmark['z']
-    #     ])
-        
-    #     self.get_logger().info(f"Landmark in LiDAR frame: [{point_lidar[0]:.3f}, {point_lidar[1]:.3f}, {point_lidar[2]:.3f}]")
-        
-    #     # Extract translation and rotation from the transform message
-
-    #     t = transform_lidar_to_camera.transform.translation
-    #     q = transform_lidar_to_camera.transform.rotation
-
-        
-    #     translation = np.array([t.x, t.y, t.z])
-    #     quaternion_xyzw = np.array([q.x, q.y, q.z, q.w])
-        
-    #     self.get_logger().info(f"Translation from TF: [{translation[0]:.6f}, {translation[1]:.6f}, {translation[2]:.6f}]")
-    #     self.get_logger().info(f"Quaternion from TF: [{quaternion_xyzw[0]:.6f}, {quaternion_xyzw[1]:.6f}, {quaternion_xyzw[2]:.6f}, {quaternion_xyzw[3]:.6f}]")
-        
-               
-    #     # Create rotation matrix
-    #     rotation = Rotation.from_quat(quaternion_xyzw)
-    #     R = rotation.as_matrix()
-        
-    #     # Build 4x4 transformation matrix
-    #     T = np.eye(4)
-    #     T[:3, :3] = R
-    #     T[:3, 3] = translation
-        
-    #     # Show what we extracted
-    #     self.get_logger().info(f"rot matrix:{R}")
-
-    #     self.get_logger().info(f"Constructed transformation matrix:")
-    #     for i in range(3):
-    #         self.get_logger().info(f"  [{T[i,0]:.6f}, {T[i,1]:.6f}, {T[i,2]:.6f}, {T[i,3]:.6f}]")
-        
-    #     # my expected transform, just leaving here for reference
-    #     # T_expected = np.array([
-    #     #     [ 0.000, -1.000,  0.000, -0.000],
-    #     #     [ 0.000,  0.000, -1.000, -0.015],
-    #     #     [ 1.000,  0.000,  0.000, -0.060],
-    #     #     [ 0.000,  0.000,  0.000,  1.000]
-    #     # ])
-        
-        
-    #     # Transform point to camera frame
-    #     point_lidar_h = np.append(point_lidar, 1.0)
-    #     point_cam_h = T @ point_lidar_h
-    #     X, Y, Z = point_cam_h[:3]
-        
-    #     self.get_logger().info(f"Point in camera frame: X={X:.3f}m (right), Y={Y:.3f}m (down), Z={Z:.3f}m (forward)")
-        
-    #     # Must be in front of camera
-    #     if Z <= 0.01:
-    #         self.get_logger().warn(f"Point behind or too close to camera: Z={Z:.3f}m")
-    #         return None
-        
-    #     # Extract camera intrinsics from self.K
-    #     fx = self.K[0, 0]
-    #     fy = self.K[1, 1]
-    #     cx = self.K[0, 2]
-    #     cy = self.K[1, 2]
-        
-    #     self.get_logger().info(f"Camera intrinsics: fx={fx:.2f}, fy={fy:.2f}, cx={cx:.2f}, cy={cy:.2f}")
-        
-    #     # Project to pixels
-    #     u_norm = X / Z
-    #     v_norm = Y / Z
-    #     u = int(fx * u_norm + cx)
-    #     v = int(fy * v_norm + cy)
-        
-    #     self.get_logger().info(f"Normalized coordinates: u'={u_norm:.3f}, v'={v_norm:.3f}")
-    #     self.get_logger().info(f"Projected pixel: u={u}, v={v}")
-        
-    #     # Check image bounds
-    #     if 0 <= u < image_width and 0 <= v < image_height:
-    #         self.get_logger().info(f"✅ VALID: Within image ({image_width}x{image_height})")
-    #         return u, v
-    #     else:
-    #         # Provide detailed feedback
-    #         out_msg = f"❌ OUTSIDE {image_width}x{image_height}: "
-    #         if u < 0:
-    #             out_msg += f"u={u} ({abs(u)}px left), "
-    #         elif u >= image_width:
-    #             out_msg += f"u={u} ({u-image_width+1}px right), "
-    #         if v < 0:
-    #             out_msg += f"v={v} ({abs(v)}px above), "
-    #         elif v >= image_height:
-    #             out_msg += f"v={v} ({v-image_height+1}px below), "
+    # ========== APRILTAG GENERATION METHODS ==========
+    
+    def pre_generate_april_tags(self):
+        """
+        Pre-generate all AprilTag patterns and store them in cache.
+        This ensures we have ready-to-use tags without runtime generation overhead.
+        """
+        try:
+            self.april_tag_available = True
             
-    #         out_msg = out_msg.rstrip(", ")
-    #         self.get_logger().warn(out_msg)
+            # Generate tags for each family and ID
+            for family_idx, family in enumerate(self.april_tag_families):
+                for tag_id in range(self.tags_per_family):  # each family has 10 tag ids that are accessed using cluster size
+                    cache_key = f"{family}_{tag_id}"
+                    
+                    # Generate the AprilTag pattern
+                    tag_pattern = self.generate_single_april_tag(family, tag_id)
+                    
+                    if tag_pattern is not None:
+                        self.april_tag_cache[cache_key] = tag_pattern
+                        self.get_logger().debug(f"Generated {family} ID:{tag_id}")
+            
+            self.get_logger().info(f"Pre-generated {len(self.april_tag_cache)} AprilTag patterns")
+            
+        except Exception as e:
+            self.april_tag_available = False
+            self.get_logger().warn(f"AprilTag generation failed: {e}")
+            self.get_logger().warn("Falling back to fallback pattern generator")
+    
+    # def generate_single_april_tag(self, family, tag_id):
+    #     """
+    #     Generate a single AprilTag pattern.
+        
+    #     This is a robust implementation that creates standard AprilTag-compatible
+    #     patterns using OpenCV drawing primitives. It follows the standard AprilTag
+    #     structure: outer black border, inner white border, and encoded pattern.
+        
+    #     Args:
+    #         family: String like 'TAG16H5', 'TAG25H7', 'TAG25H9', 'TAG36H11'
+    #         tag_id: Integer ID (0-9)
+            
+    #     Returns:
+    #         numpy array: BGR image of the AprilTag, or None if generation fails
+    #     """
+    #     try:
+    #         # Determine tag dimensions based on family
+    #         if family == 'TAG16H5':
+    #             grid_size = 16  # 16x16 grid
+    #             bits_per_axis = 4  # 4x4 bits (16 total)
+    #         elif family == 'TAG25H7':
+    #             grid_size = 25  # 25x25 grid
+    #             bits_per_axis = 5  # 5x5 bits (25 total)
+    #         elif family == 'TAG25H9':
+    #             grid_size = 25  # 25x25 grid
+    #             bits_per_axis = 5  # 5x5 bits (25 total)
+    #         elif family == 'TAG36H11':
+    #             grid_size = 36  # 36x36 grid
+    #             bits_per_axis = 6  # 6x6 bits (36 total)
+    #         else:
+    #             self.get_logger().error(f"Unknown AprilTag family: {family}")
+    #             return None
+            
+    #         # Scale factor to make tag visible at our marker size
+    #         # We want the tag grid to occupy most of the marker area
+    #         cell_size = max(1, self.marker_size // (grid_size + 4))  # +4 for borders
+    #         tag_pixels = grid_size * cell_size
+    #         total_size = tag_pixels + 4 * cell_size  # Add border margins
+            
+    #         # Create blank image (white background)
+    #         tag_img = np.ones((total_size, total_size, 3), dtype=np.uint8) * 255
+            
+    #         # Draw outer black border (standard AprilTag has thick black border)
+    #         border_thickness = cell_size
+    #         cv2.rectangle(tag_img, 
+    #                      (0, 0), 
+    #                      (total_size-1, total_size-1), 
+    #                      (0, 0, 0), 
+    #                      border_thickness)
+            
+    #         # Draw inner white border (creates contrast)
+    #         inner_margin = border_thickness
+    #         cv2.rectangle(tag_img, 
+    #                      (inner_margin, inner_margin), 
+    #                      (total_size-inner_margin-1, total_size-inner_margin-1), 
+    #                      (255, 255, 255), 
+    #                      border_thickness)
+            
+    #         # Generate the payload pattern based on tag_id
+    #         # This creates a deterministic but unique pattern for each ID
+    #         pattern_bits = self.generate_pattern_bits(tag_id, bits_per_axis)
+            
+    #         # Draw the payload (inner grid)
+    #         payload_start = 2 * cell_size
+    #         for row in range(bits_per_axis):
+    #             for col in range(bits_per_axis):
+    #                 # Calculate cell position
+    #                 x1 = payload_start + col * cell_size
+    #                 y1 = payload_start + row * cell_size
+    #                 x2 = x1 + cell_size
+    #                 y2 = y1 + cell_size
+                    
+    #                 # Color based on bit value (0=black, 1=white)
+    #                 if pattern_bits[row][col] == 0:
+    #                     color = (0, 0, 0)  # Black
+    #                 else:
+    #                     color = (255, 255, 255)  # White
+                    
+    #                 # Draw filled cell
+    #                 cv2.rectangle(tag_img, (x1, y1), (x2, y2), color, -1)
+            
+    #         # Add subtle noise to make it more "realistic" and aid detection
+    #         # (AprilTag detectors expect some imperfection)
+    #         noise = np.random.normal(0, 2, tag_img.shape).astype(np.int16)
+    #         tag_img = np.clip(tag_img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+            
+    #         # Resize to exactly marker_size x marker_size
+    #         final_tag = cv2.resize(tag_img, (self.marker_size, self.marker_size), 
+    #                               interpolation=cv2.INTER_LINEAR)
+            
+    #         return final_tag
+            
+    #     except Exception as e:
+    #         self.get_logger().error(f"Failed to generate AprilTag {family} ID:{tag_id}: {e}")
     #         return None
 
+    def generate_single_april_tag(self, family, tag_id):
+        """
+        Generate a synthetic AprilTag-like pattern.
 
+        ```
+        These are NOT real AprilTags. They are deterministic binary
+        markers used as visual landmarks for SLAM.
+
+        Each tag is:
+        - unique per tag_id
+        - asymmetric (to avoid rotation ambiguity)
+        - globally stable
+        """
+
+        try:
+
+            # Choose payload size based on family
+            if family == 'TAG16H5':
+                bits_per_axis = 4
+            elif family in ['TAG25H7', 'TAG25H9']:
+                bits_per_axis = 5
+            elif family == 'TAG36H11':
+                bits_per_axis = 6
+            else:
+                self.get_logger().error(f"Unknown tag family: {family}")
+                return None
+
+            # Total grid cells:
+            # 1 black border
+            # 1 white border
+            # payload
+            # 1 white border
+            # 1 black border
+            total_cells = bits_per_axis + 4
+
+            # Compute cell size
+            cell_size = max(1, self.marker_size // total_cells)
+            tag_size = total_cells * cell_size
+
+            # Create white background
+            tag_img = np.ones((tag_size, tag_size), dtype=np.uint8) * 255
+
+            black = 0
+            white = 255
+
+            # Deterministic RNG based on tag_id
+            rng = np.random.default_rng(tag_id)
+
+            # Generate payload bits
+            pattern_bits = rng.integers(0, 2, size=(bits_per_axis, bits_per_axis))
+
+            # Force asymmetry (important for visual orientation)
+            pattern_bits[0, 0] = 1
+            pattern_bits[-1, -1] = 0
+
+            for r in range(total_cells):
+                for c in range(total_cells):
+
+                    # Determine color of this cell
+
+                    if r == 0 or r == total_cells - 1 or c == 0 or c == total_cells - 1:
+                        color = black
+
+                    elif r == 1 or r == total_cells - 2 or c == 1 or c == total_cells - 2:
+                        color = white
+
+                    else:
+                        pr = r - 2
+                        pc = c - 2
+                        bit = pattern_bits[pr, pc]
+                        color = black if bit == 0 else white
+
+                    x1 = c * cell_size
+                    y1 = r * cell_size
+                    x2 = x1 + cell_size
+                    y2 = y1 + cell_size
+
+                    tag_img[y1:y2, x1:x2] = color
+
+            # Resize cleanly to marker size
+            final_tag = cv2.resize(
+                tag_img,
+                (self.marker_size, self.marker_size),
+                interpolation=cv2.INTER_NEAREST
+            )
+
+            # Convert to BGR if needed
+            final_tag = cv2.cvtColor(final_tag, cv2.COLOR_GRAY2BGR)
+
+            return final_tag
+
+        except Exception as e:
+            self.get_logger().error(
+                f"Failed to generate tag {family} ID:{tag_id}: {e}"
+            )
+            return None
         
+
+
+    # def generate_pattern_bits(self, tag_id, bits_per_axis):
+    #     """
+    #     Generate a deterministic binary pattern for the AprilTag payload.
+        
+    #     This creates a unique pattern for each tag_id that follows AprilTag's
+    #     requirement for balanced black/white and good corner features.
+        
+    #     Args:
+    #         tag_id: Integer ID (0-9)
+    #         bits_per_axis: Size of grid (4, 5, or 6)
+            
+    #     Returns:
+    #         2D list of 0/1 values
+    #     """
+    #     # Use seed for deterministic but varied patterns
+    #     seed = tag_id * 1000
+    #     np.random.seed(seed)
+        
+    #     # Create base pattern
+    #     pattern = np.zeros((bits_per_axis, bits_per_axis), dtype=int)
+        
+    #     # Fill with deterministic pattern based on tag_id
+    #     # This creates a balanced pattern with good corner features
+        
+    #     # Method 1: Use binary representation of tag_id
+    #     binary = format(tag_id, f'0{bits_per_axis*bits_per_axis}b')
+        
+    #     if len(binary) >= bits_per_axis * bits_per_axis:
+    #         # Fill row-major from binary string
+    #         idx = 0
+    #         for row in range(bits_per_axis):
+    #             for col in range(bits_per_axis):
+    #                 if idx < len(binary):
+    #                     pattern[row][col] = int(binary[idx])
+    #                     idx += 1
+    #     else:
+    #         # Method 2: Use combination of row/col parity and tag_id
+    #         for row in range(bits_per_axis):
+    #             for col in range(bits_per_axis):
+    #                 # XOR of row, col, and tag_id bits creates unique pattern
+    #                 val = (row ^ col ^ tag_id) % 2
+    #                 # Flip some bits based on position for more variety
+    #                 if (row * col) % 3 == 0:
+    #                     val = 1 - val
+    #                 pattern[row][col] = val
+        
+    #     # Ensure we have both black and white (not all same)
+    #     if np.all(pattern == pattern[0, 0]):
+    #         # Fix by flipping alternating cells
+    #         for row in range(bits_per_axis):
+    #             for col in range(bits_per_axis):
+    #                 if (row + col) % 2 == 0:
+    #                     pattern[row][col] = 1 - pattern[row][col]
+        
+    #     return pattern
+    
+    def get_fallback_pattern(self, intensity_quarter):
+        """
+        Generate a fallback pattern if AprilTag generation fails.
+        Creates simple geometric patterns based on intensity quarter.
+        
+        Args:
+            intensity_quarter: 0, 1, 2, or 3
+            
+        Returns:
+            numpy array: BGR image of fallback pattern
+        """
+        size = self.marker_size
+        pattern = np.zeros((size, size, 3), dtype=np.uint8)
+        
+        # Different patterns for each quarter
+        if intensity_quarter == 0:
+            # Quarter 0: Circle
+            cv2.circle(pattern, (size//2, size//2), size//3, (255, 255, 255), -1)
+            cv2.circle(pattern, (size//2, size//2), size//4, (0, 0, 0), -1)
+            
+        elif intensity_quarter == 1:
+            # Quarter 1: Square with cross
+            cv2.rectangle(pattern, (size//4, size//4), (3*size//4, 3*size//4), (255, 255, 255), -1)
+            cv2.line(pattern, (size//4, size//4), (3*size//4, 3*size//4), (0, 0, 0), 2)
+            cv2.line(pattern, (size//4, 3*size//4), (3*size//4, size//4), (0, 0, 0), 2)
+            
+        elif intensity_quarter == 2:
+            # Quarter 2: Triangle
+            pts = np.array([[size//2, size//4], 
+                           [size//4, 3*size//4], 
+                           [3*size//4, 3*size//4]], np.int32)
+            cv2.fillPoly(pattern, [pts], (255, 255, 255))
+            cv2.polylines(pattern, [pts], True, (0, 0, 0), 2)
+            
+        else:  # quarter 3
+            # Quarter 3: Checkerboard
+            cell_size = size // 4
+            for i in range(4):
+                for j in range(4):
+                    if (i + j) % 2 == 0:
+                        color = (255, 255, 255)
+                    else:
+                        color = (0, 0, 0)
+                    y1, y2 = i*cell_size, (i+1)*cell_size
+                    x1, x2 = j*cell_size, (j+1)*cell_size
+                    pattern[y1:y2, x1:x2] = color
+        
+        return pattern
+    
     def get_marker_id(self, landmark):
-        """Generate consistent marker ID for a landmark."""
+        """Generate consistent marker ID for a landmark with intensity mapping."""
         # Use quantized position and intensity as ID
         grid_size = 0.1  # 10cm grid
         
@@ -698,24 +1123,91 @@ class VisualAugmentor(Node):
         x_idx = int(landmark['x'] / grid_size)
         y_idx = int(landmark['y'] / grid_size)
         
-        # Quantize intensity (0-10 scale based on normalized intensity)
-        # Since intensities are typically <50, map to 0-10 scale appropriately
-        intensity_norm = landmark['intensity_normalized']
+        # Use ADAPTIVE normalization for intensity mapping
+        # This will spread your actual intensity range across all quarters
+        if 'intensity_normalized_adaptive' in landmark:
+            intensity_norm = landmark['intensity_normalized_adaptive']
+        else:
+            # Fallback to global if adaptive not available
+            intensity_norm = landmark['intensity_normalized']
+        
+        # Quantize intensity to 0-9 scale
         intensity_idx = min(9, int(intensity_norm * 10))
         
         # Include cluster size for uniqueness
         cluster_idx = min(9, landmark['cluster_size'])
         
-        # Include distance for uniqueness
-        #distance_idx = min(9, int(landmark['distance']))
-        
         return f"{x_idx}_{y_idx}_{intensity_idx}_{cluster_idx}"
     
-    def get_marker_pattern(self, marker_id):
-        """Get or create marker pattern for a given ID."""
+    def get_marker_pattern(self, marker_id, landmark=None):
+        """
+        Get or create AprilTag marker pattern for a given ID.
+        Maps intensity to one of 4 AprilTag families.
+        
+        The marker_id contains encoded intensity information that determines
+        which AprilTag family to use.
+        
+        Args:
+            marker_id: The marker ID string
+            landmark: The original landmark data (for logging)
+        """
         if marker_id not in self.marker_db:
-            # Generate new marker pattern
-            pattern = self.generate_marker_pattern(marker_id)
+            # Parse intensity from marker_id (format: "x_y_intensity_cluster")
+            parts = marker_id.split('_')
+            if len(parts) >= 3:
+                try:
+                    intensity_idx = int(parts[2])  # This is 0-9 from get_marker_id
+                    
+                    # Map intensity_idx (0-9) to quarter (0-3)
+                    if intensity_idx <= 2:
+                        quarter = 0
+                    elif intensity_idx <= 5:
+                        quarter = 1
+                    elif intensity_idx <= 8:
+                        quarter = 2
+                    else:
+                        quarter = 3
+                    
+                    # Select AprilTag family based on quarter
+                    family = self.april_tag_families[quarter]
+                    
+                    # Use tag_id based on cluster size and position hash for variety
+                    if len(parts) >= 4:
+                        cluster_hash = int(parts[3]) % self.tags_per_family
+                    else:
+                        cluster_hash = 0
+                    
+                    cache_key = f"{family}_{cluster_hash}"
+                    
+                    # Try to get from cache
+                    if cache_key in self.april_tag_cache:
+                        pattern = self.april_tag_cache[cache_key]
+                    elif hasattr(self, 'april_tag_available') and self.april_tag_available:
+                        # Generate on-the-fly if not in cache
+                        pattern = self.generate_single_april_tag(family, cluster_hash)
+                        if pattern is not None:
+                            self.april_tag_cache[cache_key] = pattern
+                        else:
+                            pattern = self.get_fallback_pattern(quarter)
+                    else:
+                        pattern = self.get_fallback_pattern(quarter)
+                    
+                    # ========== LOG THE INTENSITY MAPPING ==========
+                    if landmark is not None:
+                        # Get adaptive normalized value for logging
+                        adaptive_norm = landmark.get('intensity_normalized_adaptive', landmark['intensity_normalized'])
+                        self.log_intensity_mapping(landmark, intensity_idx, quarter, family, marker_id, adaptive_norm)
+                    # ================================================
+                    
+                except Exception as e:
+                    self.get_logger().warn(f"Error generating AprilTag: {e}, using fallback")
+                    quarter = int(hashlib.md5(marker_id.encode()).hexdigest(), 16) % 4
+                    pattern = self.get_fallback_pattern(quarter)
+            else:
+                # Fallback if marker_id format is unexpected
+                quarter = int(hashlib.md5(marker_id.encode()).hexdigest(), 16) % 4
+                pattern = self.get_fallback_pattern(quarter)
+            
             self.marker_db[marker_id] = pattern
             
             # Keep DB size manageable
@@ -726,168 +1218,45 @@ class VisualAugmentor(Node):
         
         return self.marker_db[marker_id]
     
-    def generate_marker_pattern(self, marker_id):
-        """
-        Generate a distinctive marker pattern optimized for ORB detection.
-        
-        ORB loves:
-        - High contrast corners
-        - Asymmetric patterns
-        - Multiple scales
-        - Binary intensity transitions
-        """
-        size = self.marker_size
-        pattern = np.zeros((size, size, 3), dtype=np.uint8)
-        
-        # Use marker_id to seed deterministic but varied patterns
-        seed = int(hashlib.md5(marker_id.encode()).hexdigest(), 16) % (2**32)
-        np.random.seed(seed)
-        
-        # Choose pattern type - bias towards checkerboard for more corners
-        pattern_types = ['checkerboard', 'circles', 'binary', 'cross']
-        pattern_type = np.random.choice(pattern_types)
-        
-        if pattern_type == 'checkerboard':
-            # Checkerboard (excellent for ORB corners)
-            # Vary cell size for scale invariance
-            cell_size_options = [4, 5, 6, 8, 10]
-            cell_size = np.random.choice(cell_size_options)
-            
-            for i in range(0, size, cell_size):
-                for j in range(0, size, cell_size):
-                    if ((i//cell_size) + (j//cell_size)) % 2 == 0:
-                        color = (255, 255, 255)  # White
-                    else:
-                        color = (0, 0, 0)  # Black
-                    pattern[i:min(i+cell_size, size), 
-                           j:min(j+cell_size, size)] = color
-        
-        elif pattern_type == 'circles':
-            # Concentric circles with spokes
-            pattern.fill(255)  # White background
-            center = size // 2
-            
-            # Draw alternating circles (creates edges)
-            num_circles = np.random.randint(3, 6)
-            for r in np.linspace(5, size//2 - 5, num_circles):
-                color = 0 if (int(r) // 5) % 2 == 0 else 255
-                thickness = np.random.choice([1, 2])
-                cv2.circle(pattern, (center, center), int(r), 
-                          (color, color, color), thickness)
-            
-            # Add radial lines (creates corners!)
-            num_lines = np.random.randint(4, 12)
-            line_thickness = np.random.choice([1, 2])
-            for angle in np.linspace(0, 2*np.pi, num_lines, endpoint=False):
-                length = size//2 - 5
-                x2 = center + int(length * np.cos(angle))
-                y2 = center + int(length * np.sin(angle))
-                cv2.line(pattern, (center, center), (x2, y2), 
-                        (0, 0, 0), line_thickness)
-        
-        elif pattern_type == 'binary':
-            # Binary code pattern (unique per marker)
-            binary_hash = hash(marker_id)
-            binary_str = format(abs(binary_hash) & 0xFFFF, '016b')
-            
-            # Create 4x4 grid from binary string
-            grid_size = size // 6
-            for i in range(6):
-                for j in range(6):
-                    idx = i * 6 + j
-                    if idx < len(binary_str) and binary_str[idx] == '1':
-                        color = (255, 255, 255)
-                    else:
-                        color = (0, 0, 0)
-                    
-                    y1, y2 = i*grid_size, (i+1)*grid_size
-                    x1, x2 = j*grid_size, (j+1)*grid_size
-                    pattern[y1:y2, x1:x2] = color
-        
-        else:  # 'cross'
-            # Cross pattern with enhancements
-            pattern.fill(255)
-            center = size // 2
-            
-            # Draw cross with varying thickness
-            cross_thickness = np.random.choice([2, 3])
-            cross_length = np.random.randint(size//3, size//2)
-            
-            cv2.line(pattern, (center-cross_length, center), 
-                    (center+cross_length, center), 
-                    (0, 0, 0), cross_thickness)
-            cv2.line(pattern, (center, center-cross_length), 
-                    (center, center+cross_length), 
-                    (0, 0, 0), cross_thickness)
-            
-            # Add corner dots for more features
-            dot_radius = np.random.choice([2, 3])
-            offset = cross_length - 5
-            positions = [
-                (center-offset, center-offset),
-                (center+offset, center-offset),
-                (center-offset, center+offset),
-                (center+offset, center+offset),
-            ]
-            for pos in positions:
-                cv2.circle(pattern, pos, dot_radius, (0, 0, 0), -1)
-        
-        # Add subtle noise (helps with scale invariance)
-        # if np.random.rand() < 0.4:
-        #     noise_intensity = np.random.randint(2, 10)
-        #     noise = np.random.randint(-noise_intensity, noise_intensity+1, 
-        #                              (size, size, 3), dtype=np.int16)
-        pattern = np.clip(pattern.astype(np.int16), 0, 255).astype(np.uint8)
-        
-        # Ensure good contrast for ORB
-        gray = cv2.cvtColor(pattern, cv2.COLOR_BGR2GRAY)
-        contrast = np.std(gray)
-        
-        if contrast < 40:  # Low contrast, enhance
-            # Histogram equalization on grayscale
-            gray_eq = cv2.equalizeHist(gray)
-            pattern = cv2.cvtColor(gray_eq, cv2.COLOR_GRAY2BGR)
-        
-        return pattern
-    
     def blend_marker(self, image, center_u, center_v, marker):
-        """Blend marker pattern onto image at specified location."""
-        h, w = marker.shape[:2]
-        half_h, half_w = h // 2, w // 2
+        """Blend marker pattern onto image at specified location and 70 pixels above."""
+        h, w = marker.shape[:2]                    # Get marker height and width
+        half_h, half_w = h // 2, w // 2            # Calculate half dimensions for centering
         
-        # Calculate ROI bounds
-        y1 = max(0, center_v - half_h)
-        y2 = min(image.shape[0], center_v + half_h)
-        x1 = max(0, center_u - half_w)
-        x2 = min(image.shape[1], center_u + half_w)
+        # ===== FIRST MARKER - Original position =====
+        # Calculate ROI bounds for original marker
+        y1 = max(0, center_v - half_h)             # Top bound - prevent going above image
+        y2 = min(image.shape[0], center_v + half_h) # Bottom bound - prevent going below image
+        x1 = max(0, center_u - half_w)             # Left bound - prevent going left of image
+        x2 = min(image.shape[1], center_u + half_w) # Right bound - prevent going right of image
         
-        # Calculate corresponding marker region
-        m_y1 = max(0, half_h - (center_v - y1))
-        m_y2 = min(h, half_h + (y2 - center_v))
-        m_x1 = max(0, half_w - (center_u - x1))
-        m_x2 = min(w, half_w + (x2 - center_u))
+        # Calculate corresponding marker region for original marker
+        m_y1 = max(0, half_h - (center_v - y1))    # Top of marker to use (if cropped)
+        m_y2 = min(h, half_h + (y2 - center_v))    # Bottom of marker to use (if cropped)
+        m_x1 = max(0, half_w - (center_u - x1))    # Left of marker to use (if cropped)
+        m_x2 = min(w, half_w + (x2 - center_u))    # Right of marker to use (if cropped)
         
-        # Extract regions
-        roi = image[y1:y2, x1:x2]
-        marker_region = marker[m_y1:m_y2, m_x1:m_x2]
+        # Extract regions for original marker
+        roi = image[y1:y2, x1:x2]                  # Extract Region of Interest from image
+        marker_region = marker[m_y1:m_y2, m_x1:m_x2] # Extract corresponding part of marker
         
-        # Ensure same size
+        # Ensure same size for original marker
         if marker_region.shape[:2] != roi.shape[:2]:
             marker_region = cv2.resize(marker_region, 
-                                      (roi.shape[1], roi.shape[0]))
+                                    (roi.shape[1], roi.shape[0]))
         
-        # Alpha blending with edge feathering
-        alpha = self.marker_opacity
+        # Alpha blending with edge feathering for original marker
+        alpha = self.marker_opacity                 # Get base opacity (typically 0.7)
         
-        # Optional: create soft mask for smoother blending
+        # Create soft mask for smoother blending if region is large enough
         if roi.shape[0] > 10 and roi.shape[1] > 10:
             # Create Gaussian mask for feathering
             mask = np.ones((roi.shape[0], roi.shape[1]), dtype=np.float32)
             border = 3
-            mask[:border, :] = 0.3
-            mask[-border:, :] = 0.3
-            mask[:, :border] = 0.3
-            mask[:, -border:] = 0.3
+            mask[:border, :] = 0.3                   # Top border - more transparent
+            mask[-border:, :] = 0.3                   # Bottom border - more transparent
+            mask[:, :border] = 0.3                    # Left border - more transparent
+            mask[:, -border:] = 0.3                   # Right border - more transparent
             
             # Expand to 3 channels
             mask_3d = np.stack([mask, mask, mask], axis=2)
@@ -895,12 +1264,61 @@ class VisualAugmentor(Node):
         else:
             alpha_adjusted = alpha
         
+        # Blend original marker
         blended = roi * (1 - alpha_adjusted) + marker_region * alpha_adjusted
         blended = blended.astype(np.uint8)
         
-        # Copy back to image
+        # Copy back to image for original marker
         image[y1:y2, x1:x2] = blended
-
+        
+        # ===== SECOND MARKER - 70 pixels above =====
+        center_v_above = center_v - 70              # Move marker up by 70 pixels
+        
+        # Only place second marker if it would be visible (within image bounds)
+        if center_v_above - half_h < image.shape[0] and center_v_above + half_h > 0:
+            
+            # Calculate ROI bounds for marker above
+            y1_above = max(0, center_v_above - half_h)
+            y2_above = min(image.shape[0], center_v_above + half_h)
+            x1_above = max(0, center_u - half_w)    # Same horizontal position
+            x2_above = min(image.shape[1], center_u + half_w)
+            
+            # Calculate corresponding marker region for marker above
+            m_y1_above = max(0, half_h - (center_v_above - y1_above))
+            m_y2_above = min(h, half_h + (y2_above - center_v_above))
+            m_x1_above = max(0, half_w - (center_u - x1_above))
+            m_x2_above = min(w, half_w + (x2_above - center_u))
+            
+            # Extract regions for marker above
+            roi_above = image[y1_above:y2_above, x1_above:x2_above]
+            marker_region_above = marker[m_y1_above:m_y2_above, m_x1_above:m_x2_above]
+            
+            # Ensure same size for marker above
+            if marker_region_above.shape[:2] != roi_above.shape[:2]:
+                marker_region_above = cv2.resize(marker_region_above, 
+                                            (roi_above.shape[1], roi_above.shape[0]))
+            
+            # Create feathering mask for marker above
+            if roi_above.shape[0] > 10 and roi_above.shape[1] > 10:
+                mask_above = np.ones((roi_above.shape[0], roi_above.shape[1]), dtype=np.float32)
+                mask_above[:border, :] = 0.3
+                mask_above[-border:, :] = 0.3
+                mask_above[:, :border] = 0.3
+                mask_above[:, -border:] = 0.3
+                mask_3d_above = np.stack([mask_above, mask_above, mask_above], axis=2)
+                alpha_adjusted_above = alpha * mask_3d_above
+            else:
+                alpha_adjusted_above = alpha
+            
+            # Blend marker above
+            blended_above = roi_above * (1 - alpha_adjusted_above) + marker_region_above * alpha_adjusted_above
+            blended_above = blended_above.astype(np.uint8)
+            
+            # Copy back to image for marker above
+            image[y1_above:y2_above, x1_above:x2_above] = blended_above
+            
+            self.get_logger().debug(f"Placed second marker at ({center_u}, {center_v_above})", 
+                                throttle_duration_sec=1.0)
 def main(args=None):
     rclpy.init(args=args)
     node = VisualAugmentor()
@@ -917,2297 +1335,11 @@ def main(args=None):
                               f"SyncCalls={node.stats['sync_calls']}, "
                               f"SkippedNoCalib={node.stats['sync_skipped_no_calib']}, "
                               f"SkippedNoLandmarks={node.stats['sync_skipped_no_landmarks']}")
+        node.get_logger().info(f"Observed intensity range: {node.observed_min_intensity:.2f} - {node.observed_max_intensity:.2f}")
+        node.get_logger().info(f"Intensity mapping log saved to: {node.log_file_path}")
     finally:
         node.destroy_node()
         rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
-
-
-# #augmentor with time sync, but multiple paths using time sync and image callback
-
-# #!/usr/bin/env python3
-# import rclpy
-# from rclpy.node import Node
-# from sensor_msgs.msg import Image, LaserScan, CameraInfo
-# from geometry_msgs.msg import PointStamped, TransformStamped
-# from cv_bridge import CvBridge
-# import cv2
-# import numpy as np
-# import tf2_ros
-# from tf2_geometry_msgs import do_transform_point
-# from tf_transformations import quaternion_matrix
-# from scipy.spatial.transform import Rotation
-# import hashlib
-# from message_filters import ApproximateTimeSynchronizer, Subscriber
-
-
-
-
-# class VisualAugmentor(Node):
-#     """
-#     Augments camera images with synthetic markers at reflectivity landmark locations.
-#     Processes LaserScan directly to extract high-reflectivity landmarks.
-    
-#     IMPORTANT: Lidar intensities are 0-255, but typically <50 in your environment.
-#     We normalize to 0-1 for consistent processing.
-#     """
-    
-#     def __init__(self):
-#         super().__init__('visual_augmentor')
-        
-#         # Enable ALL debug logging
-#         self.get_logger().set_level(rclpy.logging.LoggingSeverity.DEBUG)
-
-#         # Create subscribers for synchronization
-#         self.image_sub = Subscriber(self, Image, '/camera_optical/image')
-#         self.scan_sub = Subscriber(self, LaserScan, '/lidar/scan')
-        
-#         # Set up approximate time synchronizer
-#         # slop=0.1 means messages within 100ms of each other are considered synchronized
-#         self.ts = ApproximateTimeSynchronizer(
-#             [self.image_sub, self.scan_sub], 
-#             queue_size=10, 
-#             slop=0.1
-#         )
-#         self.ts.registerCallback(self.sync_callback)
-        
-#         # Keep original callbacks for standalone processing if needed
-#         # self.sub_image_standalone = self.create_subscription(
-#         #     Image, '/camera_optical/image', self.image_callback_standalone, 10)
-        
-#         # self.sub_scan_standalone = self.create_subscription(
-#         #     LaserScan, '/lidar/scan', self.scan_callback_standalone, 10)
-        
-#         self.sub_camera_info = self.create_subscription(
-#             CameraInfo, '/camera_optical/camera_info', self.camera_info_callback, 10)
-        
-#         # Publishers
-#         self.pub_augmented = self.create_publisher(
-#             Image, '/camera/image_augmented', 10)
-        
-#         self.pub_debug = self.create_publisher(
-#             Image, '/augmentation/debug', 10)
-        
-#         # TF
-#         self.tf_buffer = tf2_ros.Buffer()
-#         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-        
-#         # OpenCV
-#         self.bridge = CvBridge()
-        
-#         # Camera parameters
-#         self.K = None
-#         self.D = None
-#         self.camera_frame = None
-        
-#         # Lidar parameters
-#         self.lidar_frame = 'lidar'  # Adjust based on your TF tree
-        
-#         self.sensor_height = 0 #0.15  #height of lidar scan from ground
-
-#         #map frame
-#         self.map_frame = 'map'
-
-#         #lidar field of view
-#         fov_deg = 140.0
-#         self.half_fov_rad = np.deg2rad(fov_deg / 2.0)  # ≈ 1.2217 rad
-
-#         # Current state
-#         #self.current_landmarks = []  # List of dictionaries with x, y, z, intensity
-#         self.marker_db = {}  # Stores marker patterns for consistency
-#         self.latest_image = None  # Store latest image for sync processing
-#         self.latest_image_header = None
-        
-#         # CRITICAL: Intensity parameters for 0-255 range (but typically <50)
-#         self.reflectivity_threshold = 20  # Absolute threshold in 0-255 range
-#         self.relative_threshold_multiplier = 1.2  # Times max intensity in scan
-#         self.min_cluster_size = 3  # Minimum points to form a landmark
-        
-#         # Marker parameters
-#         self.marker_size = 40  # pixels
-#         self.marker_opacity = 0.6  # Blend with original image
-        
-#         # Statistics for debugging
-#         self.stats = {
-#             'scans_processed': 0,
-#             'total_points': 0,
-#             'high_reflectivity_points': 0,
-#             'landmarks_created': 0,
-#             'sync_calls': 0,
-#             'sync_skipped_no_calib': 0,
-#             'sync_skipped_no_landmarks': 0
-#         }
-        
-#         self.get_logger().info("Visual Augmentor Initialized for 0-255 intensity range")
-#         self.get_logger().info(f"Threshold: {self.reflectivity_threshold} (absolute), "
-#                               f"{self.relative_threshold_multiplier}x max (relative)")
-#         self.get_logger().info(f"Time synchronizer active: slop=0.1s, queue_size=10")
-    
-#     def camera_info_callback(self, msg):
-#         """Store camera calibration parameters and image dimensions."""
-#         self.K = np.array(msg.k).reshape(3, 3)
-#         self.D = np.array(msg.d)
-#         self.camera_frame = "camera_optical"  # msg.header.frame_id
-#         self.image_width = msg.width
-#         self.image_height = msg.height
-#         self.get_logger().info(f"Camera calibration received: {self.image_width}x{self.image_height}")
-    
-#     def sync_callback(self, image_msg, scan_msg):
-#         """
-#         Synchronized callback that receives time-aligned image and laser scan.
-#         This is the primary processing pipeline.
-#         """
-#         self.stats['sync_calls'] += 1
-        
-#         # Store latest data
-#         self.latest_image = image_msg
-#         self.latest_image_header = image_msg.header
-        
-#         # Process scan to extract landmarks
-#         landmarks = self.extract_high_reflectivity_landmarks(scan_msg)
-#         #self.current_landmarks = landmarks
-        
-#         # Log sync stats periodically
-#         if self.stats['sync_calls'] % 10 == 0:
-#             time_diff = abs(
-#                 (image_msg.header.stamp.sec + image_msg.header.stamp.nanosec*1e-9) -
-#                 (scan_msg.header.stamp.sec + scan_msg.header.stamp.nanosec*1e-9)
-#             )
-#             self.get_logger().info(
-#                 f"Sync #{self.stats['sync_calls']}: Time diff={time_diff:.3f}s, "
-#                 f"Landmarks={len(landmarks)}"
-#             )
-        
-#         # Process the synchronized pair
-#         self.process_synchronized_data(image_msg, landmarks)
-    
-#     def process_synchronized_data(self, image_msg, landmarks):
-#         """Process time-synchronized image and landmarks."""
-#         if self.K is None:
-#             self.stats['sync_skipped_no_calib'] += 1
-#             self.get_logger().warn("No camera calibration yet, skipping augmentation")
-#             self.pub_augmented.publish(image_msg)
-#             return
-        
-#         if not landmarks:
-#             self.stats['sync_skipped_no_landmarks'] += 1
-#             self.pub_augmented.publish(image_msg)
-#             return
-        
-#         try:
-#             # Convert to OpenCV
-#             cv_image = self.bridge.imgmsg_to_cv2(image_msg, desired_encoding='bgr8')
-#             augmented = cv_image.copy()
-#             debug = cv_image.copy()
-            
-#             # Get transform from lidar to camera
-#             try:
-#                 tran = self.tf_buffer.lookup_transform(
-#                     self.camera_frame, self.lidar_frame,
-#                     image_msg.header.stamp,  # Use image timestamp for TF lookup
-#                     rclpy.duration.Duration(seconds=0.1))  # Timeout
-                
-#             except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
-#                     tf2_ros.ExtrapolationException) as e:
-#                 self.get_logger().warn(f"TF lookup failed: {e}")
-#                 self.pub_augmented.publish(image_msg)
-#                 return
-            
-#             # Process each landmark (reusing your existing projection logic)
-#             markers_added = 0
-#             valid_landmarks = []
-            
-#             for landmark in landmarks:
-#                 # Project landmark to image
-#                 uv = self.project_to_image(landmark) # uncomment this part if using lidar to cam static transform (anchor landmarks to lidar)-->, tran)
-#                 if uv is None:
-#                     continue
-                
-#                 u, v = uv
-                
-#                 # Check if within image bounds
-#                 if 0 <= u < cv_image.shape[1] and 0 <= v < cv_image.shape[0]:
-#                     valid_landmarks.append({
-#                         'uv': (u, v),
-#                         'landmark': landmark,
-#                         'marker_id': self.get_marker_id(landmark)
-#                     })
-            
-#             if not valid_landmarks:
-#                 self.get_logger().debug("No landmarks projected to image")
-#                 self.pub_augmented.publish(image_msg)
-#                 return
-            
-#             # Sort by normalized intensity (strongest first)
-#             valid_landmarks.sort(key=lambda x: x['landmark']['intensity_normalized'], reverse=True)
-            
-#             # Limit number of markers to avoid clutter
-#             max_markers = min(10, len(valid_landmarks))
-            
-#             for i in range(max_markers):
-#                 data = valid_landmarks[i]
-#                 u, v = data['uv']
-#                 landmark = data['landmark']
-                
-#                 # Create or retrieve marker
-#                 marker_pattern = self.get_marker_pattern(data['marker_id'])
-                
-#                 # Blend marker onto image
-#                 self.blend_marker(augmented, u, v, marker_pattern)
-                
-#                 # Draw debug visualization with color based on intensity
-#                 intensity_norm = landmark['intensity_normalized']
-#                 color_intensity = int(intensity_norm * 255)
-                
-#                 # Color gradient: blue (low) -> green (medium) -> red (high)
-#                 if intensity_norm < 0.33:
-#                     color = (255, int(color_intensity * 3), 0)  # Blue to cyan
-#                 elif intensity_norm < 0.66:
-#                     color = (255 - int(color_intensity * 1.5), 255, 0)  # Cyan to green
-#                 else:
-#                     color = (0, 255 - int(color_intensity * 0.5), color_intensity)  # Green to red
-                
-#                 cv2.circle(debug, (u, v), 8, color, 2)
-#                 cv2.putText(debug, f"{landmark['intensity']:.0f}", 
-#                            (u+10, v), cv2.FONT_HERSHEY_SIMPLEX, 
-#                            0.5, color, 1)
-                
-#                 markers_added += 1
-            
-#             # Publish augmented image
-#             augmented_msg = self.bridge.cv2_to_imgmsg(augmented, encoding='bgr8')
-#             augmented_msg.header = image_msg.header
-#             self.pub_augmented.publish(augmented_msg)
-            
-#             # Publish debug visualization with statistics
-#             debug_stats = (
-#                 f"Sync #{self.stats['sync_calls']}: {markers_added}/{len(valid_landmarks)} | "
-#                 f"Landmarks: {len(landmarks)}"
-#             )
-#             cv2.putText(debug, debug_stats, 
-#                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-#                        0.7, (0, 255, 0), 2)
-            
-#             debug_msg = self.bridge.cv2_to_imgmsg(debug, encoding='bgr8')
-#             debug_msg.header = image_msg.header
-#             self.pub_debug.publish(debug_msg)
-            
-#             self.get_logger().debug(
-#                 f"Added {markers_added} synthetic markers from {len(landmarks)} landmarks",
-#                 throttle_duration_sec=1.0
-#             )
-            
-#         except Exception as e:
-#             self.get_logger().error(f"Augmentation failed: {e}")
-#             # Pass through original image on error
-#             self.pub_augmented.publish(image_msg)
-    
-#     # def scan_callback_standalone(self, msg):
-#     #     """Standalone scan processing (when not synchronized with image)."""
-#     #     landmarks = self.extract_high_reflectivity_landmarks(msg)
-#     #     self.current_landmarks = landmarks
-        
-#     #     self.get_logger().debug(
-#     #         f"Standalone scan: {len(landmarks)} landmarks",
-#     #         throttle_duration_sec=2.0
-#     #     )
-    
-#     # def image_callback_standalone(self, msg):
-#     #     """Standalone image processing (when not synchronized with scan)."""
-#     #     if self.K is None or not self.current_landmarks:
-#     #         self.pub_augmented.publish(msg)
-#     #         return
-        
-#     #     self.process_synchronized_data(msg, self.current_landmarks)
-        
-#     def extract_high_reflectivity_landmarks(self, scan_msg):
-#         """
-#         Extract and cluster high reflectivity points from LaserScan.
-#         Intensities are 0-255, but typically <50 in your environment.
-        
-#         Returns: List of dictionaries with keys:
-#             'x', 'y', 'z', 'intensity', 'cluster_size', 'intensity_normalized'
-#         """
-#         ranges = np.array(scan_msg.ranges)
-#         intensities = np.array(scan_msg.intensities, dtype=np.float32)
-        
-#         self.stats['total_points'] += len(intensities)
-        
-#         if len(intensities) == 0:
-#             return []
-        
-#         # Create angle array
-#         angles = scan_msg.angle_min + np.arange(len(ranges)) * scan_msg.angle_increment
-        
-#         # Filter valid points (range > 0 and finite intensity)
-#         valid_mask = (ranges > scan_msg.range_min) & (ranges < scan_msg.range_max)
-#         valid_mask &= np.isfinite(intensities)
-
-                
-#         # In ROS LaserScan coordinates:
-#         # 0 rad → forward
-#         # +π/2 → left
-#         # −π/2 → right
-#         # ±π → directly behind
-#         # Angle-based FOV filtering (±70 degrees), swap the negtive sign after rotating lidar
-#         rear_fov_mask = (
-#         (angles <= np.pi - self.half_fov_rad) |
-#         (angles >= -np.pi + self.half_fov_rad))
-#         #valid_mask &= rear_fov_mask
-        
-#         valid_ranges = ranges[valid_mask]
-#         valid_intensities = intensities[valid_mask]
-#         valid_angles = angles[valid_mask]
-        
-#         if len(valid_ranges) == 0:
-#             return []
-        
-#         # Calculate dynamic threshold based on YOUR typical intensity range (<50)
-#         max_intensity = np.max(valid_intensities)
-#         min_intensity = np.min(valid_intensities)
-        
-#         # CRITICAL: Two-part threshold for your data:
-#         # 1. Absolute threshold (e.g., >20 in 0-255 range)
-#         # 2. Relative threshold (e.g., >2x median intensity)
-#         median_intensity = np.median(valid_intensities)
-        
-#         # Dynamic threshold calculation
-#         absolute_threshold = self.reflectivity_threshold
-#         relative_threshold = median_intensity * self.relative_threshold_multiplier
-        
-#         # Use whichever is higher to be conservative
-#         threshold = max(absolute_threshold, relative_threshold)
-        
-#         self.get_logger().debug(
-#             f"Intensity thresholds: max={max_intensity:.1f}, "
-#             f"median={median_intensity:.1f}, "
-#             f"abs_thresh={absolute_threshold}, "
-#             f"rel_thresh={relative_threshold:.1f}, "
-#             f"final={threshold:.1f}",
-#             throttle_duration_sec=2.0
-#         )
-        
-#         # Find high reflectivity points
-#         high_reflectivity_mask = valid_intensities > threshold
-#         self.stats['high_reflectivity_points'] += np.sum(high_reflectivity_mask)
-        
-#         high_ranges = valid_ranges[high_reflectivity_mask]
-#         high_intensities = valid_intensities[high_reflectivity_mask]
-#         high_angles = valid_angles[high_reflectivity_mask]
-        
-#         if len(high_ranges) == 0:
-#             return []
-        
-#         # Convert to Cartesian coordinates
-#         x = high_ranges * np.cos(high_angles)
-#         y = high_ranges * np.sin(high_angles)
-#         z = np.full_like(x, self.sensor_height)  # Creates array of same shape as x, filled with sensor_height
-        
-#         # Adaptive clustering: use larger radius for distant points
-#         # (points further away are more sparse in Cartesian space)
-#         landmarks = []
-#         processed = np.zeros(len(x), dtype=bool)
-        
-#         for i in range(len(x)):
-#             if processed[i]:
-#                 continue
-            
-#             # Adaptive cluster radius based on distance
-#             distance = np.sqrt(x[i]**2 + y[i]**2)
-#             cluster_radius = 0.1 + 0.05 * (distance / 5.0)  # 0.1m at 0m, increases with distance
-            
-#             # Find points close to this one
-#             distances = np.sqrt((x - x[i])**2 + (y - y[i])**2)
-#             cluster_mask = distances < cluster_radius
-            
-#             # Create landmark from cluster if large enough
-#             cluster_size = np.sum(cluster_mask)
-#             if cluster_size >= self.min_cluster_size:
-#                 cluster_x = np.mean(x[cluster_mask])
-#                 cluster_y = np.mean(y[cluster_mask])
-#                 cluster_z = np.mean(z[cluster_mask])
-#                 cluster_intensity = np.mean(high_intensities[cluster_mask])
-                
-#                 # Normalize intensity to 0-1 for consistent processing
-#                 # Since max is typically <50, normalize to 0-100 scale
-#                 intensity_normalized = min(cluster_intensity / 100.0, 1.0)
-                
-#                 landmarks.append({
-#                     'x': float(cluster_x),
-#                     'y': float(cluster_y),
-#                     'z': float(cluster_z),
-#                     'intensity': float(cluster_intensity),  # Original 0-255
-#                     'intensity_normalized': float(intensity_normalized),  # Normalized 0-1
-#                     'cluster_size': int(cluster_size),
-#                     'distance': float(distance),
-#                     'raw_points': list(zip(x[cluster_mask], y[cluster_mask]))
-#                 })
-                
-#                 processed[cluster_mask] = True
-#                 self.stats['landmarks_created'] += 1
-        
-#         return landmarks
-    
-#     # def image_callback(self, msg):
-#     #     """DEPRECATED: Use sync_callback or standalone callbacks instead.
-#     #        Kept for backward compatibility."""
-#     #     self.get_logger().warn("Using deprecated image_callback - switch to sync_callback")
-#     #     if self.K is None or not self.current_landmarks:
-#     #         self.pub_augmented.publish(msg)
-#     #         return
-        
-#     #     try:
-#     #         # Convert to OpenCV
-#     #         self.cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-#     #         augmented = self.cv_image.copy()
-#     #         debug = self.cv_image.copy()
-            
-#     #         # Get transform from lidar to camera,# uncomment this part if using lidar to cam static transform (project_to image function)
-#     #         # try:
-#     #         #     tran = self.tf_buffer.lookup_transform(
-#     #         #         self.camera_frame, self.lidar_frame,
-#     #         #         rclpy.time.Time())
-#     #         #     self.get_logger().debug(f"Raw transform: {tran}")
-            
-#     #         # except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
-#     #         #         tf2_ros.ExtrapolationException) as e:
-#     #         #     self.get_logger().warn(f"TF lookup failed: {e}")
-#     #         #     self.pub_augmented.publish(msg)
-#     #         #     return
-            
-#     #         # Process each landmark
-#     #         markers_added = 0
-#     #         valid_landmarks = []
-            
-#     #         for landmark in self.current_landmarks:
-#     #             # Project landmark to image
-#     #             uv = self.project_to_image(landmark) # uncomment this part if using lidar to cam static transform (anchor landmarks to lidar) -->, tran)
-#     #             if uv is None:
-#     #                 continue
-                
-#     #             u, v = uv
-                
-#     #             # Check if within image bounds
-#     #             if 0 <= u < self.cv_image.shape[1] and 0 <= v < self.cv_image.shape[0]:
-#     #                 valid_landmarks.append({
-#     #                     'uv': (u, v),
-#     #                     'landmark': landmark,
-#     #                     'marker_id': self.get_marker_id(landmark)
-#     #                 })
-            
-#     #         if not valid_landmarks:
-#     #             self.get_logger().debug("No landmarks projected to image")
-#     #             self.pub_augmented.publish(msg)
-#     #             return
-            
-#     #         # Sort by normalized intensity (strongest first)
-#     #         valid_landmarks.sort(key=lambda x: x['landmark']['intensity_normalized'], reverse=True)
-            
-#     #         # Limit number of markers to avoid clutter
-#     #         max_markers = min(10, len(valid_landmarks))
-            
-#     #         for i in range(max_markers):
-#     #             data = valid_landmarks[i]
-#     #             u, v = data['uv']
-#     #             landmark = data['landmark']
-                
-#     #             # Create or retrieve marker
-#     #             marker_pattern = self.get_marker_pattern(data['marker_id'])
-                
-#     #             # Blend marker onto image
-#     #             self.blend_marker(augmented, u, v, marker_pattern)
-                
-#     #             # Draw debug visualization with color based on intensity
-#     #             # Use normalized intensity for color mapping
-#     #             intensity_norm = landmark['intensity_normalized']
-#     #             color_intensity = int(intensity_norm * 255)
-                
-#     #             # Color gradient: blue (low) -> green (medium) -> red (high)
-#     #             if intensity_norm < 0.33:
-#     #                 color = (255, int(color_intensity * 3), 0)  # Blue to cyan
-#     #             elif intensity_norm < 0.66:
-#     #                 color = (255 - int(color_intensity * 1.5), 255, 0)  # Cyan to green
-#     #             else:
-#     #                 color = (0, 255 - int(color_intensity * 0.5), color_intensity)  # Green to red
-                
-#     #             cv2.circle(debug, (u, v), 8, color, 2)
-#     #             cv2.putText(debug, f"{landmark['intensity']:.0f}", 
-#     #                        (u+10, v), cv2.FONT_HERSHEY_SIMPLEX, 
-#     #                        0.5, color, 1)
-                
-#     #             markers_added += 1
-            
-#     #         # Publish augmented image
-#     #         augmented_msg = self.bridge.cv2_to_imgmsg(augmented, encoding='bgr8')
-#     #         augmented_msg.header = msg.header
-#     #         self.pub_augmented.publish(augmented_msg)
-            
-#     #         # Publish debug visualization with statistics
-#     #         debug_stats = (
-#     #             f"Markers: {markers_added}/{len(valid_landmarks)} | "
-#     #             f"Landmarks: {len(self.current_landmarks)}"
-#     #         )
-#     #         cv2.putText(debug, debug_stats, 
-#     #                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-#     #                    0.7, (0, 255, 0), 2)
-            
-#     #         debug_msg = self.bridge.cv2_to_imgmsg(debug, encoding='bgr8')
-#     #         debug_msg.header = msg.header
-#     #         self.pub_debug.publish(debug_msg)
-            
-#     #         self.get_logger().debug(
-#     #             f"Added {markers_added} synthetic markers from {len(self.current_landmarks)} landmarks",
-#     #             throttle_duration_sec=1.0
-#     #         )
-            
-#     #     except Exception as e:
-#     #         self.get_logger().error(f"Augmentation failed: {e}")
-#     #         # Pass through original image on error
-#     #         self.pub_augmented.publish(msg)
-        
-
-#    #project image function for using lidar-map-camera transform (anchoring lidar landmarks to map)
-#     def project_to_image(self, landmark):
-#         """
-#         Project a world-anchored LiDAR landmark into camera image pixels.
-
-#         Pipeline:
-#         LiDAR → MAP → CAMERA_OPTICAL → IMAGE
-#         """
-
-#         if self.K is None:
-#             self.get_logger().warn("Camera intrinsics not available")
-#             return None
-
-#         try:
-#             #get lidar to map transform
-#             transform_l_m = self.tf_buffer.lookup_transform(
-#             self.map_frame,  # target
-#             self.lidar_frame,   # source
-#             rclpy.time.Time()
-#         )
-#             #get map to camera transform
-#             transform_m_c = self.tf_buffer.lookup_transform(
-#             self.camera_frame,  # target
-#             self.map_frame,   # source
-#             rclpy.time.Time()
-#         )
-                 
-#             p_lidar = PointStamped()
-#             p_lidar.header.frame_id = self.lidar_frame
-#             #p_lidar.header.stamp= msg.header.stamp
-#             p_lidar.point.x = landmark["x"]
-#             p_lidar.point.y = landmark["y"]
-#             p_lidar.point.z = landmark["z"]
-
-
-
-#             p_map = do_transform_point(p_lidar, transform_l_m)
-#             self.get_logger().info(f"p_map: {p_map}")
-            
-#             p_cam = do_transform_point(p_map, transform_m_c)
-#             self.get_logger().info(f"p_cam: {p_cam}")
-
-
-#             X = p_cam.point.x
-#             Y = p_cam.point.y
-#             Z = p_cam.point.z
-
-
-#                 #  Alternative method using transform from Lidar to map directly
-#             #  better to move thr transform_cam block to the top of script for efficency since its static
-#             # transform_cam = self.tf_buffer.lookup_transform(
-#             #     self.cam_frame,  # target
-#             #     self.lidar_frame,   # source
-#             #     rclpy.time.Time()
-#             # )
-#             #     t = transform_cam.transform.translation
-#             #     q = transform_cam.transform.rotation
-
-                
-#             #     translation = np.array([t.x, t.y, t.z])
-#             #     quaternion_xyzw = np.array([q.x, q.y, q.z, q.w])
-                
-#             #     self.get_logger().info(f"Translation from TF: [{translation[0]:.6f}, {translation[1]:.6f}, {translation[2]:.6f}]")
-#             #     self.get_logger().info(f"Quaternion from TF: [{quaternion_xyzw[0]:.6f}, {quaternion_xyzw[1]:.6f}, {quaternion_xyzw[2]:.6f}, {quaternion_xyzw[3]:.6f}]")
-                
-#             #    # Create rotation matrix
-#             #     rotation = Rotation.from_quat(quaternion_xyzw)
-#             #     R = rotation.as_matrix()
-#             #     self.get_logger().warn(f"TF rot : {R}")
-            
-#             #             # Build 4x4 transformation matrix
-#             #     T = np.eye(4)
-#             #     T[:3, :3] = R
-#             #     T[:3, 3] = translation
-
-
-#                     # Build point in LiDAR frame
-#             # point_lidar = np.array([
-#             #     landmark['x'],
-#             #     landmark['y'],
-#             #     landmark['z']
-#             # ])
-
-#             # point_lidar_h = np.append(point_lidar, 1.0)
-#             # point_cam_h = T @ point_lidar_h
-#             #X, Y, Z = point_cam_h[:3]
-
-            
-
-#             # Camera optical frame: Z forward
-#             self.get_logger().info(f"Z: {Z}")
-
-#             if Z <= 0.01:
-#                 return None
-
-#             # 3) Camera projection
-#             fx = self.K[0, 0]
-#             fy = self.K[1, 1]
-#             cx = self.K[0, 2]
-#             cy = self.K[1, 2]
-
-#             u = int(fx * (X / Z) + cx)
-#             v = int(fy * (Y / Z) + cy)
-#             self.get_logger().info(f" u , v: ({u}, {v})")
-
-#             image_width = self.image_width
-#             image_height = self.image_height
-
-
-#             # 4) Image bounds check
-#             if 0 <= u < self.image_width and 0 <= v < self.image_height:
-#                 self.get_logger().info(f"✅ VALID: Within image ({image_width}x{image_height})")
-#                 return (u, v)
-
-#             else:
-#                 # Provide detailed feedback
-#                 out_msg = f"❌ OUTSIDE {image_width}x{image_height}: "
-#                 if u < 0:
-#                     out_msg += f"u={u} ({abs(u)}px left), "
-#                 elif u >= image_width:
-#                     out_msg += f"u={u} ({u-image_width+1}px right), "
-#                 if v < 0:
-#                     out_msg += f"v={v} ({abs(v)}px above), "
-#                 elif v >= image_height:
-#                     out_msg += f"v={v} ({v-image_height+1}px below), "
-                
-#                 out_msg = out_msg.rstrip(", ")
-#                 self.get_logger().warn(out_msg)
-#                 return None
-
-
-#         except (
-#             tf2_ros.LookupException,
-#             tf2_ros.ConnectivityException,
-#             tf2_ros.ExtrapolationException
-#         ) as e:
-#             self.get_logger().warn(f"TF error during projection: {e}")
-#             return None
-
-
-#     # use this functiont if using lidar to cam static transform to anchor landmarks to lidar
-#     # def project_to_image(self, landmark, transform_lidar_to_camera):
-#     #     """
-#     #     Project a single LiDAR landmark into image pixel coordinates.
-#     #     Uses the transform from the ROS message dynamically and camera intrinsics from self.K.
-#     #     """
-        
-#     #     # Check if camera intrinsics are available
-#     #     if not hasattr(self, 'K') or self.K is None:
-#     #         self.get_logger().error("Camera intrinsics (K matrix) not available yet. Waiting for camera_info message.")
-#     #         return None
-        
-#     #     if not hasattr(self, 'image_width') or not hasattr(self, 'image_height'):
-#     #         self.get_logger().warn("Image dimensions not available, using defaults 640x480")
-#     #         image_width = 640
-#     #         image_height = 480
-#     #     else:
-#     #         image_width = self.image_width
-#     #         image_height = self.image_height
-        
-#     #     # Build point in LiDAR frame
-#     #     point_lidar = np.array([
-#     #         landmark['x'],
-#     #         landmark['y'],
-#     #         landmark['z']
-#     #     ])
-        
-#     #     self.get_logger().info(f"Landmark in LiDAR frame: [{point_lidar[0]:.3f}, {point_lidar[1]:.3f}, {point_lidar[2]:.3f}]")
-        
-#     #     # Extract translation and rotation from the transform message
-
-#     #     t = transform_lidar_to_camera.transform.translation
-#     #     q = transform_lidar_to_camera.transform.rotation
-
-        
-#     #     translation = np.array([t.x, t.y, t.z])
-#     #     quaternion_xyzw = np.array([q.x, q.y, q.z, q.w])
-        
-#     #     self.get_logger().info(f"Translation from TF: [{translation[0]:.6f}, {translation[1]:.6f}, {translation[2]:.6f}]")
-#     #     self.get_logger().info(f"Quaternion from TF: [{quaternion_xyzw[0]:.6f}, {quaternion_xyzw[1]:.6f}, {quaternion_xyzw[2]:.6f}, {quaternion_xyzw[3]:.6f}]")
-        
-               
-#     #     # Create rotation matrix
-#     #     rotation = Rotation.from_quat(quaternion_xyzw)
-#     #     R = rotation.as_matrix()
-        
-#     #     # Build 4x4 transformation matrix
-#     #     T = np.eye(4)
-#     #     T[:3, :3] = R
-#     #     T[:3, 3] = translation
-        
-#     #     # Show what we extracted
-#     #     self.get_logger().info(f"rot matrix:{R}")
-
-#     #     self.get_logger().info(f"Constructed transformation matrix:")
-#     #     for i in range(3):
-#     #         self.get_logger().info(f"  [{T[i,0]:.6f}, {T[i,1]:.6f}, {T[i,2]:.6f}, {T[i,3]:.6f}]")
-        
-#     #     # my expected transform, just leaving here for reference
-#     #     # T_expected = np.array([
-#     #     #     [ 0.000, -1.000,  0.000, -0.000],
-#     #     #     [ 0.000,  0.000, -1.000, -0.015],
-#     #     #     [ 1.000,  0.000,  0.000, -0.060],
-#     #     #     [ 0.000,  0.000,  0.000,  1.000]
-#     #     # ])
-        
-        
-#     #     # Transform point to camera frame
-#     #     point_lidar_h = np.append(point_lidar, 1.0)
-#     #     point_cam_h = T @ point_lidar_h
-#     #     X, Y, Z = point_cam_h[:3]
-        
-#     #     self.get_logger().info(f"Point in camera frame: X={X:.3f}m (right), Y={Y:.3f}m (down), Z={Z:.3f}m (forward)")
-        
-#     #     # Must be in front of camera
-#     #     if Z <= 0.01:
-#     #         self.get_logger().warn(f"Point behind or too close to camera: Z={Z:.3f}m")
-#     #         return None
-        
-#     #     # Extract camera intrinsics from self.K
-#     #     fx = self.K[0, 0]
-#     #     fy = self.K[1, 1]
-#     #     cx = self.K[0, 2]
-#     #     cy = self.K[1, 2]
-        
-#     #     self.get_logger().info(f"Camera intrinsics: fx={fx:.2f}, fy={fy:.2f}, cx={cx:.2f}, cy={cy:.2f}")
-        
-#     #     # Project to pixels
-#     #     u_norm = X / Z
-#     #     v_norm = Y / Z
-#     #     u = int(fx * u_norm + cx)
-#     #     v = int(fy * v_norm + cy)
-        
-#     #     self.get_logger().info(f"Normalized coordinates: u'={u_norm:.3f}, v'={v_norm:.3f}")
-#     #     self.get_logger().info(f"Projected pixel: u={u}, v={v}")
-        
-#     #     # Check image bounds
-#     #     if 0 <= u < image_width and 0 <= v < image_height:
-#     #         self.get_logger().info(f"✅ VALID: Within image ({image_width}x{image_height})")
-#     #         return u, v
-#     #     else:
-#     #         # Provide detailed feedback
-#     #         out_msg = f"❌ OUTSIDE {image_width}x{image_height}: "
-#     #         if u < 0:
-#     #             out_msg += f"u={u} ({abs(u)}px left), "
-#     #         elif u >= image_width:
-#     #             out_msg += f"u={u} ({u-image_width+1}px right), "
-#     #         if v < 0:
-#     #             out_msg += f"v={v} ({abs(v)}px above), "
-#     #         elif v >= image_height:
-#     #             out_msg += f"v={v} ({v-image_height+1}px below), "
-            
-#     #         out_msg = out_msg.rstrip(", ")
-#     #         self.get_logger().warn(out_msg)
-#     #         return None
-
-
-        
-#     def get_marker_id(self, landmark):
-#         """Generate consistent marker ID for a landmark."""
-#         # Use quantized position and intensity as ID
-#         grid_size = 0.1  # 10cm grid
-        
-#         # Quantize position
-#         x_idx = int(landmark['x'] / grid_size)
-#         y_idx = int(landmark['y'] / grid_size)
-        
-#         # Quantize intensity (0-10 scale based on normalized intensity)
-#         # Since intensities are typically <50, map to 0-10 scale appropriately
-#         intensity_norm = landmark['intensity_normalized']
-#         intensity_idx = min(9, int(intensity_norm * 10))
-        
-#         # Include cluster size for uniqueness
-#         cluster_idx = min(9, landmark['cluster_size'])
-        
-#         # Include distance for uniqueness
-#         distance_idx = min(9, int(landmark['distance']))
-        
-#         return f"{x_idx}_{y_idx}_{intensity_idx}_{cluster_idx}_{distance_idx}"
-    
-#     def get_marker_pattern(self, marker_id):
-#         """Get or create marker pattern for a given ID."""
-#         if marker_id not in self.marker_db:
-#             # Generate new marker pattern
-#             pattern = self.generate_marker_pattern(marker_id)
-#             self.marker_db[marker_id] = pattern
-            
-#             # Keep DB size manageable
-#             if len(self.marker_db) > 100:
-#                 # Remove oldest entry
-#                 oldest_key = next(iter(self.marker_db))
-#                 del self.marker_db[oldest_key]
-        
-#         return self.marker_db[marker_id]
-    
-#     def generate_marker_pattern(self, marker_id):
-#         """
-#         Generate a distinctive marker pattern optimized for ORB detection.
-        
-#         ORB loves:
-#         - High contrast corners
-#         - Asymmetric patterns
-#         - Multiple scales
-#         - Binary intensity transitions
-#         """
-#         size = self.marker_size
-#         pattern = np.zeros((size, size, 3), dtype=np.uint8)
-        
-#         # Use marker_id to seed deterministic but varied patterns
-#         seed = int(hashlib.md5(marker_id.encode()).hexdigest(), 16) % (2**32)
-#         np.random.seed(seed)
-        
-#         # Choose pattern type - bias towards checkerboard for more corners
-#         pattern_types = ['checkerboard', 'circles', 'binary', 'cross']
-#         pattern_type = np.random.choice(pattern_types)
-        
-#         if pattern_type == 'checkerboard':
-#             # Checkerboard (excellent for ORB corners)
-#             # Vary cell size for scale invariance
-#             cell_size_options = [4, 5, 6, 8, 10]
-#             cell_size = np.random.choice(cell_size_options)
-            
-#             for i in range(0, size, cell_size):
-#                 for j in range(0, size, cell_size):
-#                     if ((i//cell_size) + (j//cell_size)) % 2 == 0:
-#                         color = (255, 255, 255)  # White
-#                     else:
-#                         color = (0, 0, 0)  # Black
-#                     pattern[i:min(i+cell_size, size), 
-#                            j:min(j+cell_size, size)] = color
-        
-#         elif pattern_type == 'circles':
-#             # Concentric circles with spokes
-#             pattern.fill(255)  # White background
-#             center = size // 2
-            
-#             # Draw alternating circles (creates edges)
-#             num_circles = np.random.randint(3, 6)
-#             for r in np.linspace(5, size//2 - 5, num_circles):
-#                 color = 0 if (int(r) // 5) % 2 == 0 else 255
-#                 thickness = np.random.choice([1, 2])
-#                 cv2.circle(pattern, (center, center), int(r), 
-#                           (color, color, color), thickness)
-            
-#             # Add radial lines (creates corners!)
-#             num_lines = np.random.randint(4, 12)
-#             line_thickness = np.random.choice([1, 2])
-#             for angle in np.linspace(0, 2*np.pi, num_lines, endpoint=False):
-#                 length = size//2 - 5
-#                 x2 = center + int(length * np.cos(angle))
-#                 y2 = center + int(length * np.sin(angle))
-#                 cv2.line(pattern, (center, center), (x2, y2), 
-#                         (0, 0, 0), line_thickness)
-        
-#         elif pattern_type == 'binary':
-#             # Binary code pattern (unique per marker)
-#             binary_hash = hash(marker_id)
-#             binary_str = format(abs(binary_hash) & 0xFFFF, '016b')
-            
-#             # Create 4x4 grid from binary string
-#             grid_size = size // 4
-#             for i in range(4):
-#                 for j in range(4):
-#                     idx = i * 4 + j
-#                     if idx < len(binary_str) and binary_str[idx] == '1':
-#                         color = (255, 255, 255)
-#                     else:
-#                         color = (0, 0, 0)
-                    
-#                     y1, y2 = i*grid_size, (i+1)*grid_size
-#                     x1, x2 = j*grid_size, (j+1)*grid_size
-#                     pattern[y1:y2, x1:x2] = color
-        
-#         else:  # 'cross'
-#             # Cross pattern with enhancements
-#             pattern.fill(255)
-#             center = size // 2
-            
-#             # Draw cross with varying thickness
-#             cross_thickness = np.random.choice([2, 3])
-#             cross_length = np.random.randint(size//3, size//2)
-            
-#             cv2.line(pattern, (center-cross_length, center), 
-#                     (center+cross_length, center), 
-#                     (0, 0, 0), cross_thickness)
-#             cv2.line(pattern, (center, center-cross_length), 
-#                     (center, center+cross_length), 
-#                     (0, 0, 0), cross_thickness)
-            
-#             # Add corner dots for more features
-#             dot_radius = np.random.choice([2, 3])
-#             offset = cross_length - 5
-#             positions = [
-#                 (center-offset, center-offset),
-#                 (center+offset, center-offset),
-#                 (center-offset, center+offset),
-#                 (center+offset, center+offset),
-#             ]
-#             for pos in positions:
-#                 cv2.circle(pattern, pos, dot_radius, (0, 0, 0), -1)
-        
-#         # Add subtle noise (helps with scale invariance)
-#         if np.random.rand() < 0.4:
-#             noise_intensity = np.random.randint(10, 25)
-#             noise = np.random.randint(-noise_intensity, noise_intensity+1, 
-#                                      (size, size, 3), dtype=np.int16)
-#             pattern = np.clip(pattern.astype(np.int16) + noise, 0, 255).astype(np.uint8)
-        
-#         # Ensure good contrast for ORB
-#         gray = cv2.cvtColor(pattern, cv2.COLOR_BGR2GRAY)
-#         contrast = np.std(gray)
-        
-#         if contrast < 40:  # Low contrast, enhance
-#             # Histogram equalization on grayscale
-#             gray_eq = cv2.equalizeHist(gray)
-#             pattern = cv2.cvtColor(gray_eq, cv2.COLOR_GRAY2BGR)
-        
-#         return pattern
-    
-#     def blend_marker(self, image, center_u, center_v, marker):
-#         """Blend marker pattern onto image at specified location."""
-#         h, w = marker.shape[:2]
-#         half_h, half_w = h // 2, w // 2
-        
-#         # Calculate ROI bounds
-#         y1 = max(0, center_v - half_h)
-#         y2 = min(image.shape[0], center_v + half_h)
-#         x1 = max(0, center_u - half_w)
-#         x2 = min(image.shape[1], center_u + half_w)
-        
-#         # Calculate corresponding marker region
-#         m_y1 = max(0, half_h - (center_v - y1))
-#         m_y2 = min(h, half_h + (y2 - center_v))
-#         m_x1 = max(0, half_w - (center_u - x1))
-#         m_x2 = min(w, half_w + (x2 - center_u))
-        
-#         # Extract regions
-#         roi = image[y1:y2, x1:x2]
-#         marker_region = marker[m_y1:m_y2, m_x1:m_x2]
-        
-#         # Ensure same size
-#         if marker_region.shape[:2] != roi.shape[:2]:
-#             marker_region = cv2.resize(marker_region, 
-#                                       (roi.shape[1], roi.shape[0]))
-        
-#         # Alpha blending with edge feathering
-#         alpha = self.marker_opacity
-        
-#         # Optional: create soft mask for smoother blending
-#         if roi.shape[0] > 10 and roi.shape[1] > 10:
-#             # Create Gaussian mask for feathering
-#             mask = np.ones((roi.shape[0], roi.shape[1]), dtype=np.float32)
-#             border = 3
-#             mask[:border, :] = 0.3
-#             mask[-border:, :] = 0.3
-#             mask[:, :border] = 0.3
-#             mask[:, -border:] = 0.3
-            
-#             # Expand to 3 channels
-#             mask_3d = np.stack([mask, mask, mask], axis=2)
-#             alpha_adjusted = alpha * mask_3d
-#         else:
-#             alpha_adjusted = alpha
-        
-#         blended = roi * (1 - alpha_adjusted) + marker_region * alpha_adjusted
-#         blended = blended.astype(np.uint8)
-        
-#         # Copy back to image
-#         image[y1:y2, x1:x2] = blended
-
-# def main(args=None):
-#     rclpy.init(args=args)
-#     node = VisualAugmentor()
-    
-#     try:
-#         rclpy.spin(node)
-#     except KeyboardInterrupt:
-#         node.get_logger().info("Shutting down...")
-#         # Print final statistics
-#         node.get_logger().info(f"Final stats: Scans={node.stats['scans_processed']}, "
-#                               f"Points={node.stats['total_points']}, "
-#                               f"HighReflect={node.stats['high_reflectivity_points']}, "
-#                               f"Landmarks={node.stats['landmarks_created']}, "
-#                               f"SyncCalls={node.stats['sync_calls']}, "
-#                               f"SkippedNoCalib={node.stats['sync_skipped_no_calib']}, "
-#                               f"SkippedNoLandmarks={node.stats['sync_skipped_no_landmarks']}")
-#     finally:
-#         node.destroy_node()
-#         rclpy.shutdown()
-
-# if __name__ == '__main__':
-#     main()
-
-#augmentor without time sync and has a faulty transforation section
-# #!/usr/bin/env python3
-# import rclpy
-# from rclpy.node import Node
-# from sensor_msgs.msg import Image, LaserScan, CameraInfo
-# from geometry_msgs.msg import PointStamped, TransformStamped
-# from cv_bridge import CvBridge
-# import cv2
-# import numpy as np
-# import tf2_ros
-# from tf2_geometry_msgs import do_transform_point
-# from tf_transformations import quaternion_matrix
-# from scipy.spatial.transform import Rotation
-# from scipy.linalg import inv
-
-
-
-
-# class VisualAugmentor(Node):
-#     """
-#     Augments camera images with synthetic markers at reflectivity landmark locations.
-#     Processes LaserScan directly to extract high-reflectivity landmarks.
-    
-#     IMPORTANT: Lidar intensities are 0-255, but typically <50 in your environment.
-#     We normalize to 0-1 for consistent processing.
-#     """
-    
-#     def __init__(self):
-#         super().__init__('visual_augmentor')
-        
-#         # Enable ALL debug logging
-#         self.get_logger().set_level(rclpy.logging.LoggingSeverity.DEBUG)
-
-#         # Subscribers
-#         self.sub_image = self.create_subscription(
-#             Image, '/camera_optical/image', self.image_callback, 10)
-        
-#         self.sub_scan = self.create_subscription(
-#             LaserScan, '/lidar/scan', self.scan_callback, 10)
-        
-#         self.sub_camera_info = self.create_subscription(
-#             CameraInfo, '/camera_optical/camera_info', self.camera_info_callback, 10)
-        
-#         # Publishers
-#         self.pub_augmented = self.create_publisher(
-#             Image, '/camera/image_augmented', 10)
-        
-#         self.pub_debug = self.create_publisher(
-#             Image, '/augmentation/debug', 10)
-        
-#         # TF
-#         self.tf_buffer = tf2_ros.Buffer()
-#         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-        
-#         # OpenCV
-#         self.bridge = CvBridge()
-        
-#         # Camera parameters
-#         self.K = None
-#         self.D = None
-#         self.camera_frame = None
-        
-#         # Lidar parameters
-#         self.lidar_frame = 'lidar'  # Adjust based on your TF tree
-        
-#         self.sensor_height = 0 #0.15  #height of lidar scan from ground
-
-#         #lidar field of view
-#         fov_deg = 140.0
-#         self.half_fov_rad = np.deg2rad(fov_deg / 2.0)  # ≈ 1.2217 rad
-
-#         # Current state
-#         self.current_landmarks = []  # List of dictionaries with x, y, z, intensity
-#         self.marker_db = {}  # Stores marker patterns for consistency
-        
-#         # CRITICAL: Intensity parameters for 0-255 range (but typically <50)
-#         self.reflectivity_threshold = 20  # Absolute threshold in 0-255 range
-#         self.relative_threshold_multiplier = 1.2  # Times max intensity in scan
-#         self.min_cluster_size = 3  # Minimum points to form a landmark
-        
-#         # Marker parameters
-#         self.marker_size = 40  # pixels
-#         self.marker_opacity = 0.6  # Blend with original image
-        
-#         # Statistics for debugging
-#         self.stats = {
-#             'scans_processed': 0,
-#             'total_points': 0,
-#             'high_reflectivity_points': 0,
-#             'landmarks_created': 0
-#         }
-        
-#         self.get_logger().info("Visual Augmentor Initialized for 0-255 intensity range")
-#         self.get_logger().info(f"Threshold: {self.reflectivity_threshold} (absolute), "
-#                               f"{self.relative_threshold_multiplier}x max (relative)")
-    
-#     def camera_info_callback(self, msg):
-#         """Store camera calibration parameters and image dimensions."""
-#         self.K = np.array(msg.k).reshape(3, 3)
-#         self.D = np.array(msg.d)
-#         self.camera_frame = "camera_optical"  # msg.header.frame_id
-#         self.image_width = msg.width
-#         self.image_height = msg.height
-#         self.get_logger().info(f"Camera calibration received: {self.image_width}x{self.image_height}")
-        
-#     def scan_callback(self, msg):
-#         """Process laser scan to extract reflectivity landmarks."""
-#         self.stats['scans_processed'] += 1
-        
-#         try:
-#             landmarks = self.extract_high_reflectivity_landmarks(msg)
-            
-#             # Update landmarks
-#             self.current_landmarks = landmarks
-            
-#             # Log statistics periodically
-#             if self.stats['scans_processed'] % 10 == 0:
-#                 self.log_intensity_stats(msg)
-            
-#             self.get_logger().debug(
-#                 f"Scan {self.stats['scans_processed']}: "
-#                 f"Extracted {len(landmarks)} reflectivity landmarks",
-#                 throttle_duration_sec=1.0
-#             )
-            
-#         except Exception as e:
-#             self.get_logger().error(f"Scan processing failed: {e}")
-    
-#     def log_intensity_stats(self, scan_msg):
-#         """Log intensity statistics for debugging."""
-#         intensities = np.array(scan_msg.intensities)
-        
-#         if len(intensities) > 0:
-#             valid_intensities = intensities[intensities > 0]  # Filter zeros
-            
-#             if len(valid_intensities) > 0:
-#                 stats = {
-#                     'min': np.min(valid_intensities),
-#                     'max': np.max(valid_intensities),
-#                     'mean': np.mean(valid_intensities),
-#                     'median': np.median(valid_intensities),
-#                     'std': np.std(valid_intensities),
-#                     'above_20': np.sum(valid_intensities > 20),
-#                     'above_30': np.sum(valid_intensities > 30),
-#                     'above_50': np.sum(valid_intensities > 50),
-#                 }
-                
-#                 self.get_logger().info(
-#                     f"Intensity stats: "
-#                     f"min={stats['min']:.1f}, "
-#                     f"max={stats['max']:.1f}, "
-#                     f"mean={stats['mean']:.1f}, "
-#                     f"median={stats['median']:.1f}, "
-#                     f">20={stats['above_20']}, "
-#                     f">30={stats['above_30']}, "
-#                     f">50={stats['above_50']}",
-#                     throttle_duration_sec=5.0
-#                 )
-    
-#     def extract_high_reflectivity_landmarks(self, scan_msg):
-#         """
-#         Extract and cluster high reflectivity points from LaserScan.
-#         Intensities are 0-255, but typically <50 in your environment.
-        
-#         Returns: List of dictionaries with keys:
-#             'x', 'y', 'z', 'intensity', 'cluster_size', 'intensity_normalized'
-#         """
-#         ranges = np.array(scan_msg.ranges)
-#         intensities = np.array(scan_msg.intensities, dtype=np.float32)
-        
-#         self.stats['total_points'] += len(intensities)
-        
-#         if len(intensities) == 0:
-#             return []
-        
-#         # Create angle array
-#         angles = scan_msg.angle_min + np.arange(len(ranges)) * scan_msg.angle_increment
-        
-#         # Filter valid points (range > 0 and finite intensity)
-#         valid_mask = (ranges > scan_msg.range_min) & (ranges < scan_msg.range_max)
-#         valid_mask &= np.isfinite(intensities)
-
-                
-#         # In ROS LaserScan coordinates:
-#         # 0 rad → forward
-#         # +π/2 → left
-#         # −π/2 → right
-#         # ±π → directly behind
-#         # Angle-based FOV filtering (±70 degrees), swap the negtive sign after rotating lidar
-#         rear_fov_mask = (
-#         (angles <= np.pi - self.half_fov_rad) |
-#         (angles >= -np.pi + self.half_fov_rad))
-#         #valid_mask &= rear_fov_mask
-        
-#         valid_ranges = ranges[valid_mask]
-#         valid_intensities = intensities[valid_mask]
-#         valid_angles = angles[valid_mask]
-        
-#         if len(valid_ranges) == 0:
-#             return []
-        
-#         # Calculate dynamic threshold based on YOUR typical intensity range (<50)
-#         max_intensity = np.max(valid_intensities)
-#         min_intensity = np.min(valid_intensities)
-        
-#         # CRITICAL: Two-part threshold for your data:
-#         # 1. Absolute threshold (e.g., >20 in 0-255 range)
-#         # 2. Relative threshold (e.g., >2x median intensity)
-#         median_intensity = np.median(valid_intensities)
-        
-#         # Dynamic threshold calculation
-#         absolute_threshold = self.reflectivity_threshold
-#         relative_threshold = median_intensity * self.relative_threshold_multiplier
-        
-#         # Use whichever is higher to be conservative
-#         threshold = max(absolute_threshold, relative_threshold)
-        
-#         self.get_logger().debug(
-#             f"Intensity thresholds: max={max_intensity:.1f}, "
-#             f"median={median_intensity:.1f}, "
-#             f"abs_thresh={absolute_threshold}, "
-#             f"rel_thresh={relative_threshold:.1f}, "
-#             f"final={threshold:.1f}",
-#             throttle_duration_sec=2.0
-#         )
-        
-#         # Find high reflectivity points
-#         high_reflectivity_mask = valid_intensities > threshold
-#         self.stats['high_reflectivity_points'] += np.sum(high_reflectivity_mask)
-        
-#         high_ranges = valid_ranges[high_reflectivity_mask]
-#         high_intensities = valid_intensities[high_reflectivity_mask]
-#         high_angles = valid_angles[high_reflectivity_mask]
-        
-#         if len(high_ranges) == 0:
-#             return []
-        
-#         # Convert to Cartesian coordinates
-#         x = high_ranges * np.cos(high_angles)
-#         y = high_ranges * np.sin(high_angles)
-#         z = np.full_like(x, self.sensor_height)  # Creates array of same shape as x, filled with sensor_height
-        
-#         # Adaptive clustering: use larger radius for distant points
-#         # (points further away are more sparse in Cartesian space)
-#         landmarks = []
-#         processed = np.zeros(len(x), dtype=bool)
-        
-#         for i in range(len(x)):
-#             if processed[i]:
-#                 continue
-            
-#             # Adaptive cluster radius based on distance
-#             distance = np.sqrt(x[i]**2 + y[i]**2)
-#             cluster_radius = 0.1 + 0.05 * (distance / 5.0)  # 0.1m at 0m, increases with distance
-            
-#             # Find points close to this one
-#             distances = np.sqrt((x - x[i])**2 + (y - y[i])**2)
-#             cluster_mask = distances < cluster_radius
-            
-#             # Create landmark from cluster if large enough
-#             cluster_size = np.sum(cluster_mask)
-#             if cluster_size >= self.min_cluster_size:
-#                 cluster_x = np.mean(x[cluster_mask])
-#                 cluster_y = np.mean(y[cluster_mask])
-#                 cluster_z = np.mean(z[cluster_mask])
-#                 cluster_intensity = np.mean(high_intensities[cluster_mask])
-                
-#                 # Normalize intensity to 0-1 for consistent processing
-#                 # Since max is typically <50, normalize to 0-100 scale
-#                 intensity_normalized = min(cluster_intensity / 100.0, 1.0)
-                
-#                 landmarks.append({
-#                     'x': float(cluster_x),
-#                     'y': float(cluster_y),
-#                     'z': float(cluster_z),
-#                     'intensity': float(cluster_intensity),  # Original 0-255
-#                     'intensity_normalized': float(intensity_normalized),  # Normalized 0-1
-#                     'cluster_size': int(cluster_size),
-#                     'distance': float(distance),
-#                     'raw_points': list(zip(x[cluster_mask], y[cluster_mask]))
-#                 })
-                
-#                 processed[cluster_mask] = True
-#                 self.stats['landmarks_created'] += 1
-        
-#         return landmarks
-    
-#     def image_callback(self, msg):
-#         """Augment image with markers at reflectivity landmark locations."""
-#         if self.K is None or not self.current_landmarks:
-#             # Pass through if no calibration or landmarks
-#             self.pub_augmented.publish(msg)
-#             return
-        
-#         try:
-#             # Convert to OpenCV
-#             self.cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-#             augmented = self.cv_image.copy()
-#             debug = self.cv_image.copy()
-            
-#             # Get transform from lidar to camera
-#             try:
-#                 tran = self.tf_buffer.lookup_transform(
-#                     self.camera_frame, self.lidar_frame,
-#                     rclpy.time.Time())
-#                 self.get_logger().debug(f"Raw transform: {tran}")
-            
-#             except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
-#                     tf2_ros.ExtrapolationException) as e:
-#                 self.get_logger().warn(f"TF lookup failed: {e}")
-#                 self.pub_augmented.publish(msg)
-#                 return
-            
-#             # Process each landmark
-#             markers_added = 0
-#             valid_landmarks = []
-            
-#             for landmark in self.current_landmarks:
-#                 # Project landmark to image
-#                 uv = self.project_to_image(landmark, tran)
-#                 if uv is None:
-#                     continue
-                
-#                 u, v = uv
-                
-#                 # Check if within image bounds
-#                 if 0 <= u < self.cv_image.shape[1] and 0 <= v < self.cv_image.shape[0]:
-#                     valid_landmarks.append({
-#                         'uv': (u, v),
-#                         'landmark': landmark,
-#                         'marker_id': self.get_marker_id(landmark)
-#                     })
-            
-#             if not valid_landmarks:
-#                 self.get_logger().debug("No landmarks projected to image")
-#                 self.pub_augmented.publish(msg)
-#                 return
-            
-#             # Sort by normalized intensity (strongest first)
-#             valid_landmarks.sort(key=lambda x: x['landmark']['intensity_normalized'], reverse=True)
-            
-#             # Limit number of markers to avoid clutter
-#             max_markers = min(10, len(valid_landmarks))
-            
-#             for i in range(max_markers):
-#                 data = valid_landmarks[i]
-#                 u, v = data['uv']
-#                 landmark = data['landmark']
-                
-#                 # Create or retrieve marker
-#                 marker_pattern = self.get_marker_pattern(data['marker_id'])
-                
-#                 # Blend marker onto image
-#                 self.blend_marker(augmented, u, v, marker_pattern)
-                
-#                 # Draw debug visualization with color based on intensity
-#                 # Use normalized intensity for color mapping
-#                 intensity_norm = landmark['intensity_normalized']
-#                 color_intensity = int(intensity_norm * 255)
-                
-#                 # Color gradient: blue (low) -> green (medium) -> red (high)
-#                 if intensity_norm < 0.33:
-#                     color = (255, int(color_intensity * 3), 0)  # Blue to cyan
-#                 elif intensity_norm < 0.66:
-#                     color = (255 - int(color_intensity * 1.5), 255, 0)  # Cyan to green
-#                 else:
-#                     color = (0, 255 - int(color_intensity * 0.5), color_intensity)  # Green to red
-                
-#                 cv2.circle(debug, (u, v), 8, color, 2)
-#                 cv2.putText(debug, f"{landmark['intensity']:.0f}", 
-#                            (u+10, v), cv2.FONT_HERSHEY_SIMPLEX, 
-#                            0.5, color, 1)
-                
-#                 markers_added += 1
-            
-#             # Publish augmented image
-#             augmented_msg = self.bridge.cv2_to_imgmsg(augmented, encoding='bgr8')
-#             augmented_msg.header = msg.header
-#             self.pub_augmented.publish(augmented_msg)
-            
-#             # Publish debug visualization with statistics
-#             debug_stats = (
-#                 f"Markers: {markers_added}/{len(valid_landmarks)} | "
-#                 f"Landmarks: {len(self.current_landmarks)}"
-#             )
-#             cv2.putText(debug, debug_stats, 
-#                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-#                        0.7, (0, 255, 0), 2)
-            
-#             debug_msg = self.bridge.cv2_to_imgmsg(debug, encoding='bgr8')
-#             debug_msg.header = msg.header
-#             self.pub_debug.publish(debug_msg)
-            
-#             self.get_logger().debug(
-#                 f"Added {markers_added} synthetic markers from {len(self.current_landmarks)} landmarks",
-#                 throttle_duration_sec=1.0
-#             )
-            
-#         except Exception as e:
-#             self.get_logger().error(f"Augmentation failed: {e}")
-#             # Pass through original image on error
-#             self.pub_augmented.publish(msg)
-        
-
-#     def project_to_image(self, landmark, transform_lidar_to_camera):
-#         """
-#         Project a single LiDAR landmark into image pixel coordinates.
-#         Uses the transform from the ROS message dynamically and camera intrinsics from self.K.
-#         """
-        
-#         # Check if camera intrinsics are available
-#         if not hasattr(self, 'K') or self.K is None:
-#             self.get_logger().error("Camera intrinsics (K matrix) not available yet. Waiting for camera_info message.")
-#             return None
-        
-#         if not hasattr(self, 'image_width') or not hasattr(self, 'image_height'):
-#             self.get_logger().warn("Image dimensions not available, using defaults 640x480")
-#             image_width = 640
-#             image_height = 480
-#         else:
-#             image_width = self.image_width
-#             image_height = self.image_height
-        
-#         # Build point in LiDAR frame
-#         point_lidar = np.array([
-#             landmark['x'],
-#             landmark['y'],
-#             landmark['z']
-#         ])
-        
-#         self.get_logger().info(f"Landmark in LiDAR frame: [{point_lidar[0]:.3f}, {point_lidar[1]:.3f}, {point_lidar[2]:.3f}]")
-        
-#         # Extract translation and rotation from the transform message
-
-#         t = transform_lidar_to_camera.transform.translation
-#         q = transform_lidar_to_camera.transform.rotation
-#         #q = inv(q)
-
-        
-#         translation = np.array([t.x, t.y, t.z])
-#         quaternion_xyzw = np.array([q.x, q.y, q.z, q.w])
-        
-#         self.get_logger().info(f"Translation from TF: [{translation[0]:.6f}, {translation[1]:.6f}, {translation[2]:.6f}]")
-#         self.get_logger().info(f"Quaternion from TF: [{quaternion_xyzw[0]:.6f}, {quaternion_xyzw[1]:.6f}, {quaternion_xyzw[2]:.6f}, {quaternion_xyzw[3]:.6f}]")
-        
-#         # Convert quaternion from xyzw to wxyz format for scipy
-#         quaternion_wxyz = np.array([quaternion_xyzw[3], quaternion_xyzw[0], 
-#                                     quaternion_xyzw[1], quaternion_xyzw[2]])
-        
-#         # Create rotation matrix
-#         rotation = Rotation.from_quat(quaternion_wxyz)
-#         R = rotation.as_matrix()
-        
-#         # Build 4x4 transformation matrix
-#         T = np.eye(4)
-#         T[:3, :3] = R
-#         T[:3, 3] = translation
-        
-#         # Show what we extracted
-#         self.get_logger().info(f"rot matrix:{R}")
-
-#         self.get_logger().info(f"Constructed transformation matrix:")
-#         for i in range(3):
-#             self.get_logger().info(f"  [{T[i,0]:.6f}, {T[i,1]:.6f}, {T[i,2]:.6f}, {T[i,3]:.6f}]")
-        
-#         # Check if this matches our expected transform
-#         T_expected = np.array([
-#             [ 0.000, -1.000,  0.000, -0.000],
-#             [ 0.000,  0.000, -1.000, -0.015],
-#             [ 1.000,  0.000,  0.000, -0.060],
-#             [ 0.000,  0.000,  0.000,  1.000]
-#         ])
-        
-#         # if np.allclose(T, T_expected, atol=1e-5):
-#         #     self.get_logger().info("✅ Extracted transform matches expected transform")
-#         # else:
-#         #     self.get_logger().warn("⚠ Extracted transform differs from expected!")
-#         #     self.get_logger().info("Difference:")
-#         #     for i in range(3):
-#         #         diff_row = T[i] - T_expected[i]
-#         #         self.get_logger().info(f"  Row {i}: {diff_row}")
-        
-#         # Transform point to camera frame
-#         point_lidar_h = np.append(point_lidar, 1.0)
-#         point_cam_h = T_expected @ point_lidar_h
-#         X, Y, Z = point_cam_h[:3]
-        
-#         self.get_logger().info(f"Point in camera frame: X={X:.3f}m (right), Y={Y:.3f}m (down), Z={Z:.3f}m (forward)")
-        
-#         # Must be in front of camera
-#         if Z <= 0.01:
-#             self.get_logger().warn(f"Point behind or too close to camera: Z={Z:.3f}m")
-#             return None
-        
-#         # Extract camera intrinsics from self.K
-#         fx = self.K[0, 0]
-#         fy = self.K[1, 1]
-#         cx = self.K[0, 2]
-#         cy = self.K[1, 2]
-        
-#         self.get_logger().info(f"Camera intrinsics: fx={fx:.2f}, fy={fy:.2f}, cx={cx:.2f}, cy={cy:.2f}")
-        
-#         # Project to pixels
-#         u_norm = X / Z
-#         v_norm = Y / Z
-#         u = int(fx * u_norm + cx)
-#         v = int(fy * v_norm + cy)
-        
-#         self.get_logger().info(f"Normalized coordinates: u'={u_norm:.3f}, v'={v_norm:.3f}")
-#         self.get_logger().info(f"Projected pixel: u={u}, v={v}")
-        
-#         # Check image bounds
-#         if 0 <= u < image_width and 0 <= v < image_height:
-#             self.get_logger().info(f"✅ VALID: Within image ({image_width}x{image_height})")
-#             return u, v
-#         else:
-#             # Provide detailed feedback
-#             out_msg = f"❌ OUTSIDE {image_width}x{image_height}: "
-#             if u < 0:
-#                 out_msg += f"u={u} ({abs(u)}px left), "
-#             elif u >= image_width:
-#                 out_msg += f"u={u} ({u-image_width+1}px right), "
-#             if v < 0:
-#                 out_msg += f"v={v} ({abs(v)}px above), "
-#             elif v >= image_height:
-#                 out_msg += f"v={v} ({v-image_height+1}px below), "
-            
-#             out_msg = out_msg.rstrip(", ")
-#             self.get_logger().warn(out_msg)
-#             return None
-
-
-        
-#     def get_marker_id(self, landmark):
-#         """Generate consistent marker ID for a landmark."""
-#         # Use quantized position and intensity as ID
-#         grid_size = 0.1  # 10cm grid
-        
-#         # Quantize position
-#         x_idx = int(landmark['x'] / grid_size)
-#         y_idx = int(landmark['y'] / grid_size)
-        
-#         # Quantize intensity (0-10 scale based on normalized intensity)
-#         # Since intensities are typically <50, map to 0-10 scale appropriately
-#         intensity_norm = landmark['intensity_normalized']
-#         intensity_idx = min(9, int(intensity_norm * 10))
-        
-#         # Include cluster size for uniqueness
-#         cluster_idx = min(9, landmark['cluster_size'])
-        
-#         # Include distance for uniqueness
-#         distance_idx = min(9, int(landmark['distance']))
-        
-#         return f"{x_idx}_{y_idx}_{intensity_idx}_{cluster_idx}_{distance_idx}"
-    
-#     def get_marker_pattern(self, marker_id):
-#         """Get or create marker pattern for a given ID."""
-#         if marker_id not in self.marker_db:
-#             # Generate new marker pattern
-#             pattern = self.generate_marker_pattern(marker_id)
-#             self.marker_db[marker_id] = pattern
-            
-#             # Keep DB size manageable
-#             if len(self.marker_db) > 100:
-#                 # Remove oldest entry
-#                 oldest_key = next(iter(self.marker_db))
-#                 del self.marker_db[oldest_key]
-        
-#         return self.marker_db[marker_id]
-    
-#     def generate_marker_pattern(self, marker_id):
-#         """
-#         Generate a distinctive marker pattern optimized for ORB detection.
-        
-#         ORB loves:
-#         - High contrast corners
-#         - Asymmetric patterns
-#         - Multiple scales
-#         - Binary intensity transitions
-#         """
-#         size = self.marker_size
-#         pattern = np.zeros((size, size, 3), dtype=np.uint8)
-        
-#         # Use marker_id to seed deterministic but varied patterns
-#         seed = abs(hash(marker_id)) % 10000
-#         np.random.seed(seed)
-        
-#         # Choose pattern type - bias towards checkerboard for more corners
-#         pattern_types = ['checkerboard', 'checkerboard', 'circles', 'binary', 'cross']
-#         pattern_type = np.random.choice(pattern_types)
-        
-#         if pattern_type == 'checkerboard':
-#             # Checkerboard (excellent for ORB corners)
-#             # Vary cell size for scale invariance
-#             cell_size_options = [4, 5, 6, 8, 10]
-#             cell_size = np.random.choice(cell_size_options)
-            
-#             for i in range(0, size, cell_size):
-#                 for j in range(0, size, cell_size):
-#                     if ((i//cell_size) + (j//cell_size)) % 2 == 0:
-#                         color = (255, 255, 255)  # White
-#                     else:
-#                         color = (0, 0, 0)  # Black
-#                     pattern[i:min(i+cell_size, size), 
-#                            j:min(j+cell_size, size)] = color
-        
-#         elif pattern_type == 'circles':
-#             # Concentric circles with spokes
-#             pattern.fill(255)  # White background
-#             center = size // 2
-            
-#             # Draw alternating circles (creates edges)
-#             num_circles = np.random.randint(3, 6)
-#             for r in np.linspace(5, size//2 - 5, num_circles):
-#                 color = 0 if (int(r) // 5) % 2 == 0 else 255
-#                 thickness = np.random.choice([1, 2])
-#                 cv2.circle(pattern, (center, center), int(r), 
-#                           (color, color, color), thickness)
-            
-#             # Add radial lines (creates corners!)
-#             num_lines = np.random.randint(4, 12)
-#             line_thickness = np.random.choice([1, 2])
-#             for angle in np.linspace(0, 2*np.pi, num_lines, endpoint=False):
-#                 length = size//2 - 5
-#                 x2 = center + int(length * np.cos(angle))
-#                 y2 = center + int(length * np.sin(angle))
-#                 cv2.line(pattern, (center, center), (x2, y2), 
-#                         (0, 0, 0), line_thickness)
-        
-#         elif pattern_type == 'binary':
-#             # Binary code pattern (unique per marker)
-#             binary_hash = hash(marker_id)
-#             binary_str = format(abs(binary_hash) & 0xFFFF, '016b')
-            
-#             # Create 4x4 grid from binary string
-#             grid_size = size // 4
-#             for i in range(4):
-#                 for j in range(4):
-#                     idx = i * 4 + j
-#                     if idx < len(binary_str) and binary_str[idx] == '1':
-#                         color = (255, 255, 255)
-#                     else:
-#                         color = (0, 0, 0)
-                    
-#                     y1, y2 = i*grid_size, (i+1)*grid_size
-#                     x1, x2 = j*grid_size, (j+1)*grid_size
-#                     pattern[y1:y2, x1:x2] = color
-        
-#         else:  # 'cross'
-#             # Cross pattern with enhancements
-#             pattern.fill(255)
-#             center = size // 2
-            
-#             # Draw cross with varying thickness
-#             cross_thickness = np.random.choice([2, 3])
-#             cross_length = np.random.randint(size//3, size//2)
-            
-#             cv2.line(pattern, (center-cross_length, center), 
-#                     (center+cross_length, center), 
-#                     (0, 0, 0), cross_thickness)
-#             cv2.line(pattern, (center, center-cross_length), 
-#                     (center, center+cross_length), 
-#                     (0, 0, 0), cross_thickness)
-            
-#             # Add corner dots for more features
-#             dot_radius = np.random.choice([2, 3])
-#             offset = cross_length - 5
-#             positions = [
-#                 (center-offset, center-offset),
-#                 (center+offset, center-offset),
-#                 (center-offset, center+offset),
-#                 (center+offset, center+offset),
-#             ]
-#             for pos in positions:
-#                 cv2.circle(pattern, pos, dot_radius, (0, 0, 0), -1)
-        
-#         # Add subtle noise (helps with scale invariance)
-#         if np.random.rand() < 0.4:
-#             noise_intensity = np.random.randint(10, 25)
-#             noise = np.random.randint(-noise_intensity, noise_intensity+1, 
-#                                      (size, size, 3), dtype=np.int16)
-#             pattern = np.clip(pattern.astype(np.int16) + noise, 0, 255).astype(np.uint8)
-        
-#         # Ensure good contrast for ORB
-#         gray = cv2.cvtColor(pattern, cv2.COLOR_BGR2GRAY)
-#         contrast = np.std(gray)
-        
-#         if contrast < 40:  # Low contrast, enhance
-#             # Histogram equalization on grayscale
-#             gray_eq = cv2.equalizeHist(gray)
-#             pattern = cv2.cvtColor(gray_eq, cv2.COLOR_GRAY2BGR)
-        
-#         return pattern
-    
-#     def blend_marker(self, image, center_u, center_v, marker):
-#         """Blend marker pattern onto image at specified location."""
-#         h, w = marker.shape[:2]
-#         half_h, half_w = h // 2, w // 2
-        
-#         # Calculate ROI bounds
-#         y1 = max(0, center_v - half_h)
-#         y2 = min(image.shape[0], center_v + half_h)
-#         x1 = max(0, center_u - half_w)
-#         x2 = min(image.shape[1], center_u + half_w)
-        
-#         # Calculate corresponding marker region
-#         m_y1 = max(0, half_h - (center_v - y1))
-#         m_y2 = min(h, half_h + (y2 - center_v))
-#         m_x1 = max(0, half_w - (center_u - x1))
-#         m_x2 = min(w, half_w + (x2 - center_u))
-        
-#         # Extract regions
-#         roi = image[y1:y2, x1:x2]
-#         marker_region = marker[m_y1:m_y2, m_x1:m_x2]
-        
-#         # Ensure same size
-#         if marker_region.shape[:2] != roi.shape[:2]:
-#             marker_region = cv2.resize(marker_region, 
-#                                       (roi.shape[1], roi.shape[0]))
-        
-#         # Alpha blending with edge feathering
-#         alpha = self.marker_opacity
-        
-#         # Optional: create soft mask for smoother blending
-#         if roi.shape[0] > 10 and roi.shape[1] > 10:
-#             # Create Gaussian mask for feathering
-#             mask = np.ones((roi.shape[0], roi.shape[1]), dtype=np.float32)
-#             border = 3
-#             mask[:border, :] = 0.3
-#             mask[-border:, :] = 0.3
-#             mask[:, :border] = 0.3
-#             mask[:, -border:] = 0.3
-            
-#             # Expand to 3 channels
-#             mask_3d = np.stack([mask, mask, mask], axis=2)
-#             alpha_adjusted = alpha * mask_3d
-#         else:
-#             alpha_adjusted = alpha
-        
-#         blended = roi * (1 - alpha_adjusted) + marker_region * alpha_adjusted
-#         blended = blended.astype(np.uint8)
-        
-#         # Copy back to image
-#         image[y1:y2, x1:x2] = blended
-
-# def main(args=None):
-#     rclpy.init(args=args)
-#     node = VisualAugmentor()
-    
-#     try:
-#         rclpy.spin(node)
-#     except KeyboardInterrupt:
-#         node.get_logger().info("Shutting down...")
-#         # Print final statistics
-#         node.get_logger().info(f"Final stats: Scans={node.stats['scans_processed']}, "
-#                               f"Points={node.stats['total_points']}, "
-#                               f"HighReflect={node.stats['high_reflectivity_points']}, "
-#                               f"Landmarks={node.stats['landmarks_created']}")
-#     finally:
-#         node.destroy_node()
-#         rclpy.shutdown()
-
-# if __name__ == '__main__':
-#     main()
-
-
-
-
-# # #!/usr/bin/env python3
-# # import rclpy
-# # from rclpy.node import Node
-# # from sensor_msgs.msg import Image, LaserScan, CameraInfo
-# # from geometry_msgs.msg import PointStamped
-# # from cv_bridge import CvBridge
-# # import cv2
-# # import numpy as np
-# # import tf2_ros
-# # from tf2_geometry_msgs import do_transform_point
-
-# # class VisualAugmentor(Node):
-# #     """
-# #     Augments camera images with synthetic markers at reflectivity landmark locations.
-# #     Processes LaserScan directly to extract high-reflectivity landmarks.
-# #     """
-    
-# #     def __init__(self):
-# #         super().__init__('visual_augmentor')
-        
-# #         # Enable ALL debug logging
-# #         self.get_logger().set_level(rclpy.logging.LoggingSeverity.DEBUG)
-
-
-# #         # Subscribers
-# #         self.sub_image = self.create_subscription(
-# #             Image, '/camera_optical/image_raw', self.image_callback, 10)
-        
-# #         self.sub_scan = self.create_subscription(
-# #             LaserScan, '/lidar/scan', self.scan_callback, 10)
-        
-# #         self.sub_camera_info = self.create_subscription(
-# #             CameraInfo, '/camera_optical/camera_info', self.camera_info_callback, 10)
-        
-# #         # Publishers
-# #         self.pub_augmented = self.create_publisher(
-# #             Image, '/camera/image_augmented', 10)
-        
-# #         self.pub_debug = self.create_publisher(
-# #             Image, '/augmentation/debug', 10)
-        
-# #         # TF
-# #         self.tf_buffer = tf2_ros.Buffer()
-# #         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-        
-# #         # OpenCV
-# #         self.bridge = CvBridge()
-        
-# #         # Camera parameters
-# #         self.K = None
-# #         self.D = None
-# #         self.camera_frame = None
-        
-# #         # Lidar parameters
-# #         self.lidar_frame = 'lidar'  # Adjust based on your TF tree
-        
-# #         # Current state
-# #         self.current_landmarks = []  # List of dictionaries with x, y, z, intensity
-# #         self.marker_db = {}  # Stores marker patterns for consistency
-        
-# #         # Parameters
-# #         self.marker_size = 40  # pixels
-# #         self.marker_opacity = 0.6  # Blend with original image
-# #         self.reflectivity_threshold = 0.7  # Relative to max intensity
-# #         self.min_intensity_absolute = 0.3  # Minimum absolute intensity
-        
-# #         # Thread safety
-# #         self.landmarks_lock = False
-        
-# #         self.get_logger().info("Visual Augmentor Initialized")
-    
-# #     def camera_info_callback(self, msg):
-# #         """Store camera calibration parameters."""
-# #         self.K = np.array(msg.k).reshape(3, 3)
-# #         self.D = np.array(msg.d)
-# #         self.camera_frame = msg.header.frame_id
-# #         self.get_logger().info("Camera calibration received")
-    
-# #     def scan_callback(self, msg):
-# #         """Process laser scan to extract reflectivity landmarks."""
-# #         try:
-# #             landmarks = self.extract_high_reflectivity_landmarks(msg)
-            
-# #             # Update landmarks (with simple lock to prevent race condition)
-# #             self.current_landmarks = landmarks
-            
-# #             self.get_logger().debug(
-# #                 f"Extracted {len(landmarks)} reflectivity landmarks",
-# #                 throttle_duration_sec=2.0
-# #             )
-            
-# #         except Exception as e:
-# #             self.get_logger().error(f"Scan processing failed: {e}")
-    
-# #     def extract_high_reflectivity_landmarks(self, scan_msg):
-# #         """
-# #         Extract and cluster high reflectivity points from LaserScan.
-        
-# #         Returns: List of dictionaries with keys:
-# #             'x', 'y', 'z', 'intensity', 'cluster_size'
-# #         """
-# #         ranges = np.array(scan_msg.ranges)
-# #         intensities = np.array(scan_msg.intensities)
-        
-# #         if len(intensities) == 0:
-# #             return []
-        
-# #         # Create angle array
-# #         angles = np.linspace(scan_msg.angle_min, scan_msg.angle_max, len(ranges))
-        
-# #         # Filter valid points
-# #         valid_mask = (ranges > scan_msg.range_min) & (ranges < scan_msg.range_max)
-# #         valid_ranges = ranges[valid_mask]
-# #         valid_intensities = intensities[valid_mask]
-# #         valid_angles = angles[valid_mask]
-        
-# #         if len(valid_ranges) == 0:
-# #             return []
-        
-# #         # Calculate intensity threshold
-# #         max_intensity = np.max(valid_intensities)
-# #         if max_intensity > 0:
-# #             threshold = max(self.reflectivity_threshold * max_intensity, 
-# #                           self.min_intensity_absolute)
-# #         else:
-# #             threshold = self.min_intensity_absolute
-        
-# #         # Find high reflectivity points
-# #         high_reflectivity_mask = valid_intensities > threshold
-# #         high_ranges = valid_ranges[high_reflectivity_mask]
-# #         high_intensities = valid_intensities[high_reflectivity_mask]
-# #         high_angles = valid_angles[high_reflectivity_mask]
-        
-# #         if len(high_ranges) == 0:
-# #             return []
-        
-# #         # Convert to Cartesian coordinates
-# #         x = high_ranges * np.cos(high_angles)
-# #         y = high_ranges * np.sin(high_angles)
-# #         z = np.zeros_like(x)  # 2D lidar
-        
-# #         # Simple clustering: group points within 0.2m of each other
-# #         landmarks = []
-# #         processed = np.zeros(len(x), dtype=bool)
-        
-# #         for i in range(len(x)):
-# #             if processed[i]:
-# #                 continue
-            
-# #             # Find points close to this one
-# #             distances = np.sqrt((x - x[i])**2 + (y - y[i])**2)
-# #             cluster_mask = distances < 0.2
-            
-# #             # Create landmark from cluster
-# #             if np.sum(cluster_mask) >= 2:  # Minimum cluster size
-# #                 cluster_x = np.mean(x[cluster_mask])
-# #                 cluster_y = np.mean(y[cluster_mask])
-# #                 cluster_z = np.mean(z[cluster_mask])
-# #                 cluster_intensity = np.mean(high_intensities[cluster_mask])
-# #                 cluster_size = np.sum(cluster_mask)
-                
-# #                 landmarks.append({
-# #                     'x': float(cluster_x),
-# #                     'y': float(cluster_y),
-# #                     'z': float(cluster_z),
-# #                     'intensity': float(cluster_intensity),
-# #                     'cluster_size': int(cluster_size),
-# #                     'raw_points': list(zip(x[cluster_mask], y[cluster_mask]))
-# #                 })
-                
-# #                 processed[cluster_mask] = True
-        
-# #         return landmarks
-    
-# #     def image_callback(self, msg):
-# #         """Augment image with markers at reflectivity landmark locations."""
-# #         if self.K is None or not self.current_landmarks:
-# #             # Pass through if no calibration or landmarks
-# #             self.pub_augmented.publish(msg)
-# #             return
-        
-# #         try:
-# #             # Convert to OpenCV
-# #             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-# #             augmented = cv_image.copy()
-# #             debug = cv_image.copy()
-            
-# #             # Get transform from lidar to camera
-# #             try:
-# #                 transform = self.tf_buffer.lookup_transform(
-# #                     self.camera_frame, self.lidar_frame, 
-# #                     rclpy.time.Time())
-# #             except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
-# #                     tf2_ros.ExtrapolationException) as e:
-# #                 self.get_logger().warn(f"TF lookup failed: {e}")
-# #                 self.pub_augmented.publish(msg)
-# #                 return
-            
-# #             # Process each landmark
-# #             markers_added = 0
-# #             valid_landmarks = []
-            
-# #             for landmark in self.current_landmarks:
-# #                 # Project landmark to image
-# #                 uv = self.project_to_image(landmark, transform)
-# #                 if uv is None:
-# #                     continue
-                
-# #                 u, v = uv
-                
-# #                 # Check if within image bounds
-# #                 if 0 <= u < cv_image.shape[1] and 0 <= v < cv_image.shape[0]:
-# #                     valid_landmarks.append({
-# #                         'uv': (u, v),
-# #                         'landmark': landmark,
-# #                         'marker_id': self.get_marker_id(landmark)
-# #                     })
-            
-# #             # Sort by intensity (strongest first)
-# #             valid_landmarks.sort(key=lambda x: x['landmark']['intensity'], reverse=True)
-            
-# #             # Limit number of markers to avoid clutter
-# #             max_markers = min(10, len(valid_landmarks))
-            
-# #             for i in range(max_markers):
-# #                 data = valid_landmarks[i]
-# #                 u, v = data['uv']
-# #                 landmark = data['landmark']
-                
-# #                 # Create or retrieve marker
-# #                 marker_pattern = self.get_marker_pattern(data['marker_id'])
-                
-# #                 # Blend marker onto image
-# #                 self.blend_marker(augmented, u, v, marker_pattern)
-                
-# #                 # Draw debug visualization
-# #                 color_intensity = int(landmark['intensity'] * 255)
-# #                 color = (0, color_intensity, 255 - color_intensity)
-                
-# #                 cv2.circle(debug, (u, v), 8, color, 2)
-# #                 cv2.putText(debug, f"{landmark['intensity']:.2f}", 
-# #                            (u+10, v), cv2.FONT_HERSHEY_SIMPLEX, 
-# #                            0.5, color, 1)
-                
-# #                 markers_added += 1
-            
-# #             # Publish augmented image
-# #             augmented_msg = self.bridge.cv2_to_imgmsg(augmented, encoding='bgr8')
-# #             augmented_msg.header = msg.header
-# #             self.pub_augmented.publish(augmented_msg)
-            
-# #             # Publish debug visualization
-# #             cv2.putText(debug, f"Markers: {markers_added}", 
-# #                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-# #                        1.0, (0, 255, 0), 2)
-# #             debug_msg = self.bridge.cv2_to_imgmsg(debug, encoding='bgr8')
-# #             debug_msg.header = msg.header
-# #             self.pub_debug.publish(debug_msg)
-            
-# #             self.get_logger().debug(
-# #                 f"Added {markers_added} synthetic markers from {len(self.current_landmarks)} landmarks",
-# #                 throttle_duration_sec=1.0
-# #             )
-            
-# #         except Exception as e:
-# #             self.get_logger().error(f"Augmentation failed: {e}")
-# #             # Pass through original image on error
-# #             self.pub_augmented.publish(msg)
-    
-# #     def project_to_image(self, landmark, transform):
-# #         """Project 3D landmark to 2D image coordinates."""
-# #         try:
-# #             # Create 3D point in lidar frame
-# #             pt_lidar = PointStamped()
-# #             pt_lidar.point.x = landmark['x']
-# #             pt_lidar.point.y = landmark['y']
-# #             pt_lidar.point.z = landmark['z']
-# #             pt_lidar.header.frame_id = self.lidar_frame
-# #             pt_lidar.header.stamp = self.get_clock().now().to_msg()
-            
-# #             # Transform to camera frame
-# #             pt_camera = do_transform_point(pt_lidar, transform)
-            
-# #             # Project to 2D
-# #             point_3d = np.array([[pt_camera.point.x, pt_camera.point.y, pt_camera.point.z]])
-# #             uv, _ = cv2.projectPoints(point_3d, 
-# #                                      np.zeros(3),  # rotation vector
-# #                                      np.zeros(3),  # translation vector
-# #                                      self.K, self.D)
-            
-# #             u, v = uv[0][0].astype(int)
-# #             return (u, v)
-            
-# #         except Exception as e:
-# #             self.get_logger().debug(f"Projection failed: {e}")
-# #             return None
-    
-# #     def get_marker_id(self, landmark):
-# #         """Generate consistent marker ID for a landmark."""
-# #         # Use quantized position and intensity as ID
-# #         grid_size = 0.1  # 10cm grid
-        
-# #         # Quantize position
-# #         x_idx = int(landmark['x'] / grid_size)
-# #         y_idx = int(landmark['y'] / grid_size)
-        
-# #         # Quantize intensity (0-10 scale)
-# #         intensity_idx = min(9, int(landmark['intensity'] * 10))
-        
-# #         # Include cluster size for uniqueness
-# #         cluster_idx = min(9, landmark['cluster_size'])
-        
-# #         return f"{x_idx}_{y_idx}_{intensity_idx}_{cluster_idx}"
-    
-# #     def get_marker_pattern(self, marker_id):
-# #         """Get or create marker pattern for a given ID."""
-# #         if marker_id not in self.marker_db:
-# #             # Generate new marker pattern
-# #             pattern = self.generate_marker_pattern(marker_id)
-# #             self.marker_db[marker_id] = pattern
-            
-# #             # Keep DB size manageable
-# #             if len(self.marker_db) > 100:
-# #                 # Remove least recently accessed
-# #                 keys = list(self.marker_db.keys())
-# #                 if keys:
-# #                     del self.marker_db[keys[0]]
-        
-# #         return self.marker_db[marker_id]
-    
-# #     def generate_marker_pattern(self, marker_id):
-# #         """
-# #         Generate a distinctive marker pattern optimized for ORB detection.
-        
-# #         ORB loves:
-# #         - High contrast corners
-# #         - Asymmetric patterns
-# #         - Multiple scales
-# #         - Binary intensity transitions
-# #         """
-# #         size = self.marker_size
-# #         pattern = np.zeros((size, size, 3), dtype=np.uint8)
-        
-# #         # Use marker_id to seed deterministic but varied patterns
-# #         seed = abs(hash(marker_id)) % 10000
-# #         np.random.seed(seed)
-        
-# #         pattern_type = np.random.choice(['checkerboard', 'circles', 'binary', 'cross'])
-        
-# #         if pattern_type == 'checkerboard':
-# #             # Checkerboard (excellent for ORB corners)
-# #             cell_size = max(4, size // np.random.randint(3, 7))
-# #             for i in range(0, size, cell_size):
-# #                 for j in range(0, size, cell_size):
-# #                     if ((i//cell_size) + (j//cell_size)) % 2 == 0:
-# #                         color = (255, 255, 255)  # White
-# #                     else:
-# #                         color = (0, 0, 0)  # Black
-# #                     pattern[i:min(i+cell_size, size), 
-# #                            j:min(j+cell_size, size)] = color
-        
-# #         elif pattern_type == 'circles':
-# #             # Concentric circles with spokes
-# #             pattern.fill(255)  # White background
-# #             center = size // 2
-            
-# #             # Draw alternating circles
-# #             for r in range(3, size//2 - 2, 3):
-# #                 color = 0 if (r // 3) % 2 == 0 else 255
-# #                 cv2.circle(pattern, (center, center), r, 
-# #                           (color, color, color), 1)
-            
-# #             # Add radial lines (creates corners!)
-# #             num_lines = np.random.randint(4, 9)
-# #             for angle in np.linspace(0, 2*np.pi, num_lines, endpoint=False):
-# #                 length = size//2 - 3
-# #                 x2 = center + int(length * np.cos(angle))
-# #                 y2 = center + int(length * np.sin(angle))
-# #                 cv2.line(pattern, (center, center), (x2, y2), 
-# #                         (0, 0, 0), 1)
-        
-# #         elif pattern_type == 'binary':
-# #             # Binary code pattern (unique per marker)
-# #             binary_hash = hash(marker_id)
-# #             binary_str = format(abs(binary_hash) & 0xFFFF, '016b')
-            
-# #             # Create 4x4 grid from binary string
-# #             grid_size = size // 4
-# #             for i in range(4):
-# #                 for j in range(4):
-# #                     idx = i * 4 + j
-# #                     if idx < len(binary_str) and binary_str[idx] == '1':
-# #                         color = (255, 255, 255)
-# #                     else:
-# #                         color = (0, 0, 0)
-                    
-# #                     y1, y2 = i*grid_size, (i+1)*grid_size
-# #                     x1, x2 = j*grid_size, (j+1)*grid_size
-# #                     pattern[y1:y2, x1:x2] = color
-        
-# #         else:  # 'cross'
-# #             # Cross pattern
-# #             pattern.fill(255)
-# #             center = size // 2
-            
-# #             # Draw cross
-# #             cv2.line(pattern, (center-5, center), (center+5, center), 
-# #                     (0, 0, 0), 2)
-# #             cv2.line(pattern, (center, center-5), (center, center+5), 
-# #                     (0, 0, 0), 2)
-            
-# #             # Add corners
-# #             cv2.circle(pattern, (center-5, center-5), 2, (0, 0, 0), -1)
-# #             cv2.circle(pattern, (center+5, center-5), 2, (0, 0, 0), -1)
-# #             cv2.circle(pattern, (center-5, center+5), 2, (0, 0, 0), -1)
-# #             cv2.circle(pattern, (center+5, center+5), 2, (0, 0, 0), -1)
-        
-# #         # Add subtle noise (helps with scale invariance)
-# #         if np.random.rand() < 0.3:
-# #             noise = np.random.randint(-15, 16, (size, size, 3), dtype=np.int16)
-# #             pattern = np.clip(pattern.astype(np.int16) + noise, 0, 255).astype(np.uint8)
-        
-# #         # Ensure contrast
-# #         if np.std(pattern) < 30:
-# #             # Boost contrast
-# #             pattern = cv2.convertScaleAbs(pattern, alpha=1.5, beta=0)
-        
-# #         return pattern
-    
-# #     def blend_marker(self, image, center_u, center_v, marker):
-# #         """Blend marker pattern onto image at specified location."""
-# #         h, w = marker.shape[:2]
-# #         half_h, half_w = h // 2, w // 2
-        
-# #         # Calculate ROI bounds
-# #         y1 = max(0, center_v - half_h)
-# #         y2 = min(image.shape[0], center_v + half_h)
-# #         x1 = max(0, center_u - half_w)
-# #         x2 = min(image.shape[1], center_u + half_w)
-        
-# #         # Calculate corresponding marker region
-# #         m_y1 = max(0, half_h - (center_v - y1))
-# #         m_y2 = min(h, half_h + (y2 - center_v))
-# #         m_x1 = max(0, half_w - (center_u - x1))
-# #         m_x2 = min(w, half_w + (x2 - center_u))
-        
-# #         # Extract regions
-# #         roi = image[y1:y2, x1:x2]
-# #         marker_region = marker[m_y1:m_y2, m_x1:m_x2]
-        
-# #         # Ensure same size
-# #         if marker_region.shape[:2] != roi.shape[:2]:
-# #             marker_region = cv2.resize(marker_region, 
-# #                                       (roi.shape[1], roi.shape[0]))
-        
-# #         # Alpha blending
-# #         alpha = self.marker_opacity
-# #         blended = cv2.addWeighted(roi, 1-alpha, marker_region, alpha, 0)
-        
-# #         # Copy back to image
-# #         image[y1:y2, x1:x2] = blended
-
-# # def main(args=None):
-# #     rclpy.init(args=args)
-# #     node = VisualAugmentor()
-    
-# #     try:
-# #         rclpy.spin(node)
-# #     except KeyboardInterrupt:
-# #         pass
-# #     finally:
-# #         node.destroy_node()
-# #         rclpy.shutdown()
-
-# # if __name__ == '__main__':
-# #     main()
-
-
-
-
-
-
