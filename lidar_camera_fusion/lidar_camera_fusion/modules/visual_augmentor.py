@@ -1,4 +1,4 @@
-#normaliized all intensity for each scan before applying threshold, and use normalized intensity for each scan to better spread out the values for your specific environment. This way, even if your intensities are clustered in a narrow range (e.g., 35-44), they will be mapped across the full 0-1 range for more effective thresholding and visualization.
+#fixed timestamp error and log observed raw intensities based on fov
 
 #!/usr/bin/env python3
 import rclpy
@@ -178,7 +178,7 @@ class VisualAugmentor(Node):
         """Write header to the log file."""
         try:
             with open(self.log_file_path, 'w') as f:
-                f.write("timestamp,intensity_raw,intensity_normalized,intensity_idx,quarter,family,cluster_size,x_position,y_position,marker_id,observed_min,observed_max\n")
+                f.write("timestamp,intensity_raw,intensity_normalized,intensity_idx,quarter,family,cluster_size,x_position,y_position,marker_id,fov_observed_min,fov_observed_max\n")
             self.get_logger().info(f"Created log file: {self.log_file_path}")
         except Exception as e:
             self.get_logger().error(f"Failed to create log file: {e}")
@@ -206,8 +206,8 @@ class VisualAugmentor(Node):
                        f"{landmark.get('x', 0):.3f},"
                        f"{landmark.get('y', 0):.3f},"
                        f"{marker_id},"
-                       f"{self.observed_min_intensity if self.observed_min_intensity != float('inf') else 0:.2f},"
-                       f"{self.observed_max_intensity if self.observed_max_intensity != float('-inf') else 255:.2f}\n")
+                       f"{self.fov_observed_min_intensity if self.fov_observed_min_intensity != float('inf') else 0:.2f},"
+                       f"{self.fov_observed_max_intensity if self.fov_observed_max_intensity != float('-inf') else 255:.2f}\n")
         except Exception as e:
             self.get_logger().error(f"Failed to write to log file: {e}")
     
@@ -495,10 +495,6 @@ class VisualAugmentor(Node):
     def extract_high_reflectivity_landmarks(self, scan_msg):
         """
         Extract and cluster high reflectivity points from LaserScan.
-        Intensities are 0-255, but typically <50 in your environment.
-        
-        Returns: List of dictionaries with keys:
-            'x', 'y', 'z', 'intensity', 'cluster_size', 'intensity_normalized'
         """
         ranges = np.array(scan_msg.ranges)
         intensities = np.array(scan_msg.intensities, dtype=np.float32)
@@ -512,7 +508,6 @@ class VisualAugmentor(Node):
         angles = scan_msg.angle_min + np.arange(len(ranges)) * scan_msg.angle_increment
         
         # ========== STEP 1: BASIC FILTERS (RANGE & FINITE) FOR NORMALIZATION ==========
-        # Filter out invalid range points and non-finite intensities
         range_mask = (ranges > scan_msg.range_min) & (ranges < scan_msg.range_max)
         finite_mask = np.isfinite(intensities)
         valid_for_norm_mask = range_mask & finite_mask
@@ -523,16 +518,12 @@ class VisualAugmentor(Node):
         if len(intensities_all) == 0:
             return []
         
-        # Calculate min/max from FULL 360° scan (or full sensor FOV)
-        min_intensity_full = np.min(intensities_all)
-        max_intensity_full = np.max(intensities_all)
-
-        self.observed_min_intensity = min_intensity_full
-        self.observed_max_intensity = max_intensity_full
+        # Calculate min/max from FULL 360° scan
+        min_intensity_full = np.min(intensities_all)  #min intensities for raw intensities 
+        max_intensity_full = np.max(intensities_all)   #max intensities for raw intensities 
         
         # Normalize intensities using full range
         if max_intensity_full > min_intensity_full:
-            # Create array of normalized intensities for all valid points
             norm_intensities_full = (intensities_all - min_intensity_full) / (max_intensity_full - min_intensity_full)
         else:
             norm_intensities_full = np.zeros_like(intensities_all)
@@ -541,32 +532,20 @@ class VisualAugmentor(Node):
             f"Full scan intensity range: {min_intensity_full:.2f} - {max_intensity_full:.2f}",
             throttle_duration_sec=2.0
         )
-        # ==============================================================================
         
-        # ========== STEP 2: UPDATE SCAN-BASED INTENSITY RANGE ==========
-        # Update adaptive range using ALL valid intensities from this scan (full 360°)
-        #self.update_scan_intensity_range(norm_intensities_all)
-        # =================================================================
-        
-        # ========== STEP 3: APPLY FOV FILTER FOR PROCESSING ==========
-        # Now apply FOV filter to get only points in our region of interest
+        # ========== STEP 2: APPLY FOV FILTER ==========
         forward_fov_mask = (angles >= -self.half_fov_rad) & (angles <= self.half_fov_rad)
-        
-        # Combine with basic filters
         final_mask = valid_for_norm_mask & forward_fov_mask
         
-        # Extract filtered data (only points in our FOV)
+        # Extract filtered data
         valid_ranges = ranges[final_mask]
         valid_intensities = intensities[final_mask]
         valid_angles = angles[final_mask]
         
-        # Get corresponding normalized intensities (need to map indices carefully)
-        # Create a mapping from filtered indices to normalized values
-        # Method: Get indices of valid_for_norm_mask, then filter by FOV
+        # Get corresponding normalized intensities
         valid_norm_indices = np.where(valid_for_norm_mask)[0]
         fov_filtered_indices = valid_norm_indices[forward_fov_mask[valid_for_norm_mask]]
         
-        # Extract normalized intensities for FOV-filtered points
         if len(fov_filtered_indices) > 0:
             fov_norm_intensities = norm_intensities_full[forward_fov_mask[valid_for_norm_mask]]
         else:
@@ -580,16 +559,13 @@ class VisualAugmentor(Node):
         # Dynamic threshold calculation
         absolute_threshold = self.reflectivity_threshold
         relative_threshold = median_fov_intensity * self.relative_threshold_multiplier
-        
-        # Use whichever is higher to be conservative
         threshold = max(absolute_threshold, relative_threshold)
         
         self.get_logger().debug(
-            f"Intensity thresholds: max={threshold:.1f}, "
-            f"median={median_fov_intensity:.1f}, "
-            f"abs_thresh={absolute_threshold}, "
-            f"rel_thresh={relative_threshold:.1f}, "
-            f"final={threshold:.1f}",
+            f"Intensity thresholds: median={median_fov_intensity:.3f}, "
+            f"abs_thresh={absolute_threshold:.3f}, "
+            f"rel_thresh={relative_threshold:.3f}, "
+            f"final={threshold:.3f}",
             throttle_duration_sec=2.0
         )
         
@@ -598,8 +574,12 @@ class VisualAugmentor(Node):
         self.stats['high_reflectivity_points'] += np.sum(high_reflectivity_mask)
         
         high_ranges = valid_ranges[high_reflectivity_mask]
-        high_intensities = fov_norm_intensities[high_reflectivity_mask] #valid_norm_intensities with fov
+        high_intensities_norm = fov_norm_intensities[high_reflectivity_mask]
+        high_intensities_raw = valid_intensities[high_reflectivity_mask]  # Keep raw for logging
         high_angles = valid_angles[high_reflectivity_mask]
+
+        self.fov_observed_min_intensity = np.min(valid_intensities)  #max intensities for intensities in the FOV
+        self.fov_observed_max_intensity = np.max(valid_intensities)   #min intensities for intensities in the FOV
         
         if len(high_ranges) == 0:
             return []
@@ -607,10 +587,33 @@ class VisualAugmentor(Node):
         # Convert to Cartesian coordinates
         x = high_ranges * np.cos(high_angles)
         y = high_ranges * np.sin(high_angles)
-        z = np.full_like(x, self.sensor_height)  # Creates array of same shape as x, filled with sensor_height
+        z = np.full_like(x, self.sensor_height)
         
-        # Adaptive clustering: use larger radius for distant points
-        # (points further away are more sparse in Cartesian space)
+        # ========== FIX: GET TRANSFORM USING SCAN TIMESTAMP ==========
+        try:
+            # Use the scan's timestamp for TF lookup
+            transform_l_m = self.tf_buffer.lookup_transform(
+                self.map_frame,      # target frame
+                self.lidar_frame,    # source frame
+                scan_msg.header.stamp,  # Use the scan's timestamp!
+                rclpy.duration.Duration(seconds=0.1)  # Allow 100ms tolerance
+            )
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            self.get_logger().warn(f"TF lookup at time {scan_msg.header.stamp} failed: {e}")
+            
+            # Fallback: try the latest transform
+            try:
+                self.get_logger().info("Attempting fallback with latest transform")
+                transform_l_m = self.tf_buffer.lookup_transform(
+                    self.map_frame,
+                    self.lidar_frame,
+                    rclpy.time.Time()  # Latest available
+                )
+            except Exception as e2:
+                self.get_logger().error(f"Fallback TF lookup also failed: {e2}")
+                return []
+        
+        # ========== CREATE LANDMARKS ==========
         landmarks = []
         processed = np.zeros(len(x), dtype=bool)
         
@@ -620,152 +623,103 @@ class VisualAugmentor(Node):
             
             # Adaptive cluster radius based on distance
             distance = np.sqrt(x[i]**2 + y[i]**2)
-            cluster_radius = 0.1 + 0.05 * (distance / 5.0)  # 0.1m at 0m, increases with distance
+            cluster_radius = 0.1 + 0.05 * (distance / 5.0)
             
             # Find points close to this one
             distances = np.sqrt((x - x[i])**2 + (y - y[i])**2)
             cluster_mask = distances < cluster_radius
             
-            # Create landmark from cluster if large enough
             cluster_size = np.sum(cluster_mask)
             if cluster_size >= self.min_cluster_size:
                 cluster_x = np.mean(x[cluster_mask])
                 cluster_y = np.mean(y[cluster_mask])
                 cluster_z = np.mean(z[cluster_mask])
-                cluster_intensity = np.mean(high_intensities[cluster_mask])
-
-
-                #get lidar to map transform
-                transform_l_m = self.tf_buffer.lookup_transform(
-                self.map_frame,  # target
-                self.lidar_frame,   # source
-                rclpy.time.Time()
-                 )
-            
-                    
+                cluster_intensity_norm = np.mean(high_intensities_norm[cluster_mask])
+                cluster_intensity_raw = np.mean(high_intensities_raw[cluster_mask])
+                
+                # Transform to map frame
                 p_lidar = PointStamped()
                 p_lidar.header.frame_id = self.lidar_frame
-                #p_lidar.header.stamp= msg.header.stamp
+                p_lidar.header.stamp = scan_msg.header.stamp  # Important: set the timestamp!
                 p_lidar.point.x = cluster_x
                 p_lidar.point.y = cluster_y
                 p_lidar.point.z = cluster_z
-
-                #convert lidar to map frame
-                p_map = do_transform_point(p_lidar, transform_l_m)
-                self.get_logger().info(f"p_map: {p_map}")
                 
-                X = p_map.point.x
-                Y = p_map.point.y
-                Z = p_map.point.z
-
-                #append landmarks in map frame
+                p_map = do_transform_point(p_lidar, transform_l_m)
+                
                 landmarks.append({
-                    'x': X,
-                    'y': Y,
-                    'z': Z,
-                    'intensity': float(cluster_intensity),  # Original 0-255
-                    'intensity_normalized': float(cluster_intensity),  # Global normalized 0-1
-                    #'intensity_normalized_adaptive': float(intensity_normalized_adaptive),  # Adaptive normalized
-                    'cluster_size': int(cluster_size),
+                    'x': p_map.point.x,
+                    'y': p_map.point.y,
+                    'z': p_map.point.z,
+                    'intensity': float(cluster_intensity_raw),  # Raw intensity for logging
+                    'intensity_normalized': float(cluster_intensity_norm),  # Normalized for pattern selection
+                    'cluster_size': 1,
                     'distance': float(distance),
                     'raw_points': list(zip(x[cluster_mask], y[cluster_mask]))
                 })
                 
                 processed[cluster_mask] = True
                 self.stats['landmarks_created'] += 1
-
-
         
         return landmarks
-    
    #project image function for using lidar-map-camera transform (anchoring lidar landmarks to map)
     def project_to_image(self, landmark):
         """
         Project a world-anchored LiDAR landmark into camera image pixels.
-
-        Pipeline:
-        LiDAR → MAP → CAMERA_OPTICAL → IMAGE
+        Pipeline: MAP → CAMERA_OPTICAL → IMAGE
         """
-
         if self.K is None:
             self.get_logger().warn("Camera intrinsics not available")
             return None
 
         try:
-            #get map to camera transform
+            # ========== FIX: Use the current time or the landmark's timestamp ==========
+            # Since we don't have a specific timestamp for the landmark,
+            # we use Time(0) to get the latest transform, but with a timeout
             transform_m_c = self.tf_buffer.lookup_transform(
-            self.camera_frame,  # target
-            self.map_frame,   # source
-            rclpy.time.Time()
-        )
-               #recall lidar landmarks/points already in map frame  (extract_highreflect funct)
+                self.camera_frame,  # target
+                self.map_frame,     # source
+                rclpy.time.Time(),  # Latest available transform
+                rclpy.duration.Duration(seconds=0.1)  # 100ms timeout
+            )
+            
             p_map = PointStamped()
             p_map.header.frame_id = self.map_frame
-            #p_map.header.stamp= msg.header.stamp
             p_map.point.x = landmark["x"]
             p_map.point.y = landmark["y"]
             p_map.point.z = landmark["z"]
-
-            #transform landmarks to camera frame
+            
+            # Transform landmarks to camera frame
             p_cam = do_transform_point(p_map, transform_m_c)
-            self.get_logger().info(f"p_cam: {p_cam}")
-
-
+            
             X = p_cam.point.x
             Y = p_cam.point.y
             Z = p_cam.point.z
-
-
-            # Camera optical frame: Z forward
-            self.get_logger().info(f"Z: {Z}")
-
+            
             if Z <= 0.01:
                 return None
-
-            # 3) Camera projection
+            
+            # Camera projection
             fx = self.K[0, 0]
             fy = self.K[1, 1]
             cx = self.K[0, 2]
             cy = self.K[1, 2]
-
+            
             u = int(fx * (X / Z) + cx)
             v = int(fy * (Y / Z) + cy)
-            self.get_logger().info(f" u , v: ({u}, {v})")
-
-            image_width = self.image_width
-            image_height = self.image_height
-
-
-            # 4) Image bounds check
+            
+            # Image bounds check
             if 0 <= u < self.image_width and 0 <= v < self.image_height:
-                self.get_logger().info(f"✅ VALID: Within image ({image_width}x{image_height})")
                 return (u, v)
-
             else:
-                # Provide detailed feedback
-                out_msg = f"❌ OUTSIDE {image_width}x{image_height}: "
-                if u < 0:
-                    out_msg += f"u={u} ({abs(u)}px left), "
-                elif u >= image_width:
-                    out_msg += f"u={u} ({u-image_width+1}px right), "
-                if v < 0:
-                    out_msg += f"v={v} ({abs(v)}px above), "
-                elif v >= image_height:
-                    out_msg += f"v={v} ({v-image_height+1}px below), "
-                
-                out_msg = out_msg.rstrip(", ")
-                self.get_logger().warn(out_msg)
+                # Optional: log out-of-bounds only occasionally
+                if np.random.rand() < 0.01:  # Log ~1% of out-of-bounds
+                    self.get_logger().debug(f"Point outside image: ({u}, {v})")
                 return None
 
-
-        except (
-            tf2_ros.LookupException,
-            tf2_ros.ConnectivityException,
-            tf2_ros.ExtrapolationException
-        ) as e:
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
             self.get_logger().warn(f"TF error during projection: {e}")
             return None
-
     # ========== APRILTAG GENERATION METHODS ==========
     
     def pre_generate_april_tags(self):
