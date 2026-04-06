@@ -1,4 +1,4 @@
-#fixed timestamp error and log observed raw intensities based on fov
+#using 10 dinstinct patterns based on fov norm intensity
 
 #!/usr/bin/env python3
 import rclpy
@@ -127,7 +127,7 @@ class VisualAugmentor(Node):
         # Confirmation parameters
         self.required_observations = 10  # N = 10 observations needed for confirmation
         self.spatial_consistency_threshold = 0.2  # meters - max distance for same landmark
-        self.max_landmark_age = 5.0  # seconds - remove landmarks not seen for this long
+        self.max_landmark_age = 2.0  # seconds - remove landmarks not seen for this long
         
         # Statistics for confirmation tracking
         self.stats = {
@@ -723,24 +723,24 @@ class VisualAugmentor(Node):
     # ========== APRILTAG GENERATION METHODS ==========
     
     def pre_generate_april_tags(self):
-        """
-        Pre-generate all AprilTag patterns and store them in cache.
-        This ensures we have ready-to-use tags without runtime generation overhead.
-        """
+        """Pre-generate all AprilTag patterns for the 10-tag mapping."""
         try:
             self.april_tag_available = True
             
-            # Generate tags for each family and ID
-            for family_idx, family in enumerate(self.april_tag_families):
-                for tag_id in range(self.tags_per_family):  # each family has 10 tag ids that are accessed using cluster size
-                    cache_key = f"{family}_{tag_id}"
-                    
-                    # Generate the AprilTag pattern
-                    tag_pattern = self.generate_single_april_tag(family, tag_id)
-                    
-                    if tag_pattern is not None:
-                        self.april_tag_cache[cache_key] = tag_pattern
-                        self.get_logger().debug(f"Generated {family} ID:{tag_id}")
+            # Generate all patterns needed for the 10-tag mapping
+            patterns_needed = [
+                ('TAG16H5', 0), ('TAG16H5', 1),
+                ('TAG25H7', 0), ('TAG25H7', 1),
+                ('TAG25H9', 0), ('TAG25H9', 1),
+                ('TAG36H11', 0), ('TAG36H11', 1), ('TAG36H11', 2), ('TAG36H11', 3)
+            ]
+            
+            for family, tag_id in patterns_needed:
+                cache_key = f"{family}_{tag_id}"
+                tag_pattern = self.generate_single_april_tag(family, tag_id)
+                if tag_pattern is not None:
+                    self.april_tag_cache[cache_key] = tag_pattern
+                    self.get_logger().debug(f"Generated {family} ID:{tag_id}")
             
             self.get_logger().info(f"Pre-generated {len(self.april_tag_cache)} AprilTag patterns")
             
@@ -921,18 +921,17 @@ class VisualAugmentor(Node):
         cluster_idx = min(9, landmark['cluster_size'])
         
         return f"{x_idx}_{y_idx}_{intensity_idx}_{cluster_idx}"
-    
+        
     def get_marker_pattern(self, marker_id, landmark=None):
         """
-        Get or create AprilTag marker pattern for a given ID.
-        Maps intensity to one of 4 AprilTag families.
+        Get or create AprilTag marker pattern with 10 total tags.
+        Maps 10 intensity levels to 10 specific tag patterns across 4 families.
         
-        The marker_id contains encoded intensity information that determines
-        which AprilTag family to use.
-        
-        Args:
-            marker_id: The marker ID string
-            landmark: The original landmark data (for logging)
+        Tag Mapping (10 unique patterns):
+        - intensity 0-1: TAG16H5 IDs 0-1 (lowest intensity)
+        - intensity 2-3: TAG25H7 IDs 0-1
+        - intensity 4-5: TAG25H9 IDs 0-1
+        - intensity 6-9: TAG36H11 IDs 0-3 (highest intensity)
         """
         if marker_id not in self.marker_db:
             # Parse intensity from marker_id (format: "x_y_intensity_cluster")
@@ -941,46 +940,71 @@ class VisualAugmentor(Node):
                 try:
                     intensity_idx = int(parts[2])  # This is 0-9 from get_marker_id
                     
-                    # Map intensity_idx (0-9) to quarter (0-3)
-                    if intensity_idx <= 2:
+                    # ========== 10-TAG MAPPING SYSTEM ==========
+                    # Map each intensity level (0-9) to a specific (family, tag_id)
+                    # This creates 10 distinct patterns with increasing complexity
+                    tag_mapping = {
+                        0: ('TAG16H5', 0),   # Lowest intensity - smallest tag
+                        1: ('TAG16H5', 1),
+                        2: ('TAG25H7', 0),
+                        3: ('TAG25H7', 1),
+                        4: ('TAG25H9', 0),
+                        5: ('TAG25H9', 1),
+                        6: ('TAG36H11', 0),
+                        7: ('TAG36H11', 1),
+                        8: ('TAG36H11', 2),
+                        9: ('TAG36H11', 3),   # Highest intensity - largest tag
+                    }
+                    
+                    # Select family and tag_id based on intensity_idx
+                    family, tag_id = tag_mapping[intensity_idx]
+                    
+                    # Cache key for this specific pattern
+                    cache_key = f"{family}_{tag_id}"
+                    
+                    # Calculate quarter for logging (0-3)
+                    if intensity_idx <= 1:
                         quarter = 0
-                    elif intensity_idx <= 5:
+                    elif intensity_idx <= 3:
                         quarter = 1
-                    elif intensity_idx <= 8:
+                    elif intensity_idx <= 5:
                         quarter = 2
                     else:
                         quarter = 3
                     
-                    # Select AprilTag family based on quarter
-                    family = self.april_tag_families[quarter]
-                    
-                    # Use tag_id based on cluster size and position hash for variety
-                    if len(parts) >= 4:
-                        cluster_hash = int(parts[3]) % self.tags_per_family
-                    else:
-                        cluster_hash = 0
-                    
-                    cache_key = f"{family}_{cluster_hash}"
-                    
-                    # Try to get from cache
+                    # Try to get pattern from cache
                     if cache_key in self.april_tag_cache:
                         pattern = self.april_tag_cache[cache_key]
                     elif hasattr(self, 'april_tag_available') and self.april_tag_available:
                         # Generate on-the-fly if not in cache
-                        pattern = self.generate_single_april_tag(family, cluster_hash)
+                        pattern = self.generate_single_april_tag(family, tag_id)
                         if pattern is not None:
                             self.april_tag_cache[cache_key] = pattern
                         else:
+                            # Fallback to geometric pattern if generation fails
                             pattern = self.get_fallback_pattern(quarter)
                     else:
                         pattern = self.get_fallback_pattern(quarter)
                     
                     # ========== LOG THE INTENSITY MAPPING ==========
                     if landmark is not None:
-                        # Get adaptive normalized value for logging
-                        intensity_normalized = landmark.get('intensity_normalized', landmark['intensity_normalized'])
-                        self.log_intensity_mapping(landmark, intensity_idx, quarter, family, marker_id, intensity_normalized)
+                        # Get the intensity normalized value
+                        intensity_normalized = landmark.get('intensity_normalized', landmark['intensity'])
+                        self.log_intensity_mapping(
+                            landmark, 
+                            intensity_idx, 
+                            quarter, 
+                            family, 
+                            marker_id, 
+                            intensity_normalized
+                        )
                     # ================================================
+                    
+                    self.get_logger().debug(
+                        f"Marker ID: {marker_id} | Intensity: {intensity_idx} -> "
+                        f"Quarter: {quarter} | Family: {family} | Tag: {tag_id}",
+                        throttle_duration_sec=1.0
+                    )
                     
                 except Exception as e:
                     self.get_logger().warn(f"Error generating AprilTag: {e}, using fallback")
@@ -991,11 +1015,11 @@ class VisualAugmentor(Node):
                 quarter = int(hashlib.md5(marker_id.encode()).hexdigest(), 16) % 4
                 pattern = self.get_fallback_pattern(quarter)
             
+            # Store in database
             self.marker_db[marker_id] = pattern
             
-            # Keep DB size manageable
+            # Keep DB size manageable (limit to 100 entries)
             if len(self.marker_db) > 100:
-                # Remove oldest entry
                 oldest_key = next(iter(self.marker_db))
                 del self.marker_db[oldest_key]
         
