@@ -1,4 +1,4 @@
-#using 10 dinstinct patterns based on fov norm intensity
+#using 10 dinstinct geometric patterns based on fov norm intensity. note that outter background of the marker has same pattern as the main
 
 #!/usr/bin/env python3
 import rclpy
@@ -103,19 +103,19 @@ class VisualAugmentor(Node):
         
         # Marker parameters
         self.marker_size = 40  # pixels
-        self.marker_opacity = 0.7  # Blend with original image
+        self.marker_opacity = 0.9  # Blend with original image
 
         # For each family, we'll generate multiple tag IDs (0-9) for variety
         self.tags_per_family = 4  # IDs 0-9 available for each family  # each family has 10 tag ids that are accessed using cluster size
         
         # Cache for pre-generated AprilTag patterns
         self.april_tag_cache = {}
-        self.pre_generate_april_tags()
+        self.pre_generate_pattern()
         # ============================================
         
         # CRITICAL: Intensity parameters for 0-255 range (but typically <50)
-        self.reflectivity_threshold = 0.6  # Absolute threshold in 0-255 range
-        self.relative_threshold_multiplier = 1.2  # Times max intensity in scan
+        self.reflectivity_threshold = 0.5  # Absolute threshold in 0-255 range
+        self.relative_threshold_multiplier = 1.1  # Times max intensity in scan
         self.min_cluster_size = 3  # Minimum points to form a landmark
         
         
@@ -126,8 +126,8 @@ class VisualAugmentor(Node):
         
         # Confirmation parameters
         self.required_observations = 10  # N = 10 observations needed for confirmation
-        self.spatial_consistency_threshold = 0.2  # meters - max distance for same landmark
-        self.max_landmark_age = 2.0  # seconds - remove landmarks not seen for this long
+        self.spatial_consistency_threshold = 0.3  # meters - max distance for same landmark
+        self.max_landmark_age = 1.0  # seconds - remove landmarks not seen for this long
         
         # Statistics for confirmation tracking
         self.stats = {
@@ -426,7 +426,7 @@ class VisualAugmentor(Node):
             valid_landmarks.sort(key=lambda x: x['landmark']['intensity_normalized'], reverse=True)
             
             # Limit number of markers to avoid clutter
-            max_markers = min(10, len(valid_landmarks))
+            max_markers = min(5, len(valid_landmarks))
             
             for i in range(max_markers):
                 data = valid_landmarks[i]
@@ -492,6 +492,7 @@ class VisualAugmentor(Node):
             # Pass through original image on error
             self.pub_augmented.publish(image_msg)
         
+    
     def extract_high_reflectivity_landmarks(self, scan_msg):
         """
         Extract and cluster high reflectivity points from LaserScan.
@@ -623,7 +624,7 @@ class VisualAugmentor(Node):
             
             # Adaptive cluster radius based on distance
             distance = np.sqrt(x[i]**2 + y[i]**2)
-            cluster_radius = 0.1 + 0.05 * (distance / 5.0)
+            cluster_radius = 0.3 + 0.05 * (distance / 5.0)
             
             # Find points close to this one
             distances = np.sqrt((x - x[i])**2 + (y - y[i])**2)
@@ -631,9 +632,9 @@ class VisualAugmentor(Node):
             
             cluster_size = np.sum(cluster_mask)
             if cluster_size >= self.min_cluster_size:
-                cluster_x = np.mean(x[cluster_mask])
-                cluster_y = np.mean(y[cluster_mask])
-                cluster_z = np.mean(z[cluster_mask])
+                cluster_x = np.max(x[cluster_mask])
+                cluster_y = np.max(y[cluster_mask])
+                cluster_z = np.max(z[cluster_mask])
                 cluster_intensity_norm = np.mean(high_intensities_norm[cluster_mask])
                 cluster_intensity_raw = np.mean(high_intensities_raw[cluster_mask])
                 
@@ -722,131 +723,63 @@ class VisualAugmentor(Node):
             return None
     # ========== APRILTAG GENERATION METHODS ==========
     
-    def pre_generate_april_tags(self):
-        """Pre-generate all AprilTag patterns for the 10-tag mapping."""
+    def pre_generate_pattern(self):
+        """
+        Pre-generate all polygon patterns for the 10-tag mapping.
+        Each pattern is a white square with a black polygon inside.
+        """
         try:
             self.april_tag_available = True
             
-            # Generate all patterns needed for the 10-tag mapping
-            patterns_needed = [
-                ('TAG16H5', 0), ('TAG16H5', 1),
-                ('TAG25H7', 0), ('TAG25H7', 1),
-                ('TAG25H9', 0), ('TAG25H9', 1),
-                ('TAG36H11', 0), ('TAG36H11', 1), ('TAG36H11', 2), ('TAG36H11', 3)
-            ]
-            
-            for family, tag_id in patterns_needed:
-                cache_key = f"{family}_{tag_id}"
-                tag_pattern = self.generate_single_april_tag(family, tag_id)
+            # Generate all 10 patterns (tag_id 0-9)
+            for tag_id in range(10):
+                cache_key = f"polygon_{tag_id}"
+                
+                # Generate the polygon pattern
+                tag_pattern = self.generate_pattern("POLYGON", tag_id)
+                
                 if tag_pattern is not None:
                     self.april_tag_cache[cache_key] = tag_pattern
-                    self.get_logger().debug(f"Generated {family} ID:{tag_id}")
+                    self.get_logger().debug(f"Generated polygon pattern ID:{tag_id}")
             
-            self.get_logger().info(f"Pre-generated {len(self.april_tag_cache)} AprilTag patterns")
+            self.get_logger().info(f"Pre-generated {len(self.april_tag_cache)} polygon patterns")
             
         except Exception as e:
             self.april_tag_available = False
-            self.get_logger().warn(f"AprilTag generation failed: {e}")
+            self.get_logger().warn(f"Polygon pattern generation failed: {e}")
             self.get_logger().warn("Falling back to fallback pattern generator")
     
 
-    def generate_single_april_tag(self, family, tag_id):
+    
+    def generate_pattern(self, family, tag_id):
         """
-        Generate a synthetic AprilTag-like pattern.
-
-        ```
-        These are NOT real AprilTags. They are deterministic binary
-        markers used as visual landmarks for SLAM.
-
-        Each tag is:
-        - unique per tag_id
-        - asymmetric (to avoid rotation ambiguity)
-        - globally stable
+        Generate a simple pattern: white square with a black square inside.
         """
-
         try:
+            # Create white square background
+            marker = np.ones((self.marker_size, self.marker_size, 3), dtype=np.uint8) * 255
+            
+            # Calculate center and size
+            center = (self.marker_size // 2, self.marker_size // 2)
+            polygon_size = self.marker_size // 2  # Polygon takes 1/3 of marker size
 
-            # Choose payload size based on family
-            if family == 'TAG16H5':
-                bits_per_axis = 4
-            elif family in ['TAG25H7', 'TAG25H9']:
-                bits_per_axis = 5
-            elif family == 'TAG36H11':
-                bits_per_axis = 6
-            else:
-                self.get_logger().error(f"Unknown tag family: {family}")
-                return None
-
-            # Total grid cells:
-            # 1 black border
-            # 1 white border
-            # payload
-            # 1 white border
-            # 1 black border
-            total_cells = bits_per_axis + 4
-
-            # Compute cell size
-            cell_size = max(1, self.marker_size // total_cells)
-            tag_size = total_cells * cell_size
-
-            # Create white background
-            tag_img = np.ones((tag_size, tag_size), dtype=np.uint8) * 255
-
-            black = 0
-            white = 255
-
-            # Deterministic RNG based on tag_id
-            rng = np.random.default_rng(tag_id)
-
-            # Generate payload bits
-            pattern_bits = rng.integers(0, 2, size=(bits_per_axis, bits_per_axis))
-
-            # Force asymmetry (important for visual orientation)
-            pattern_bits[0, 0] = 1
-            pattern_bits[-1, -1] = 0
-
-            for r in range(total_cells):
-                for c in range(total_cells):
-
-                    # Determine color of this cell
-
-                    if r == 0 or r == total_cells - 1 or c == 0 or c == total_cells - 1:
-                        color = black
-
-                    elif r == 1 or r == total_cells - 2 or c == 1 or c == total_cells - 2:
-                        color = white
-
-                    else:
-                        pr = r - 2
-                        pc = c - 2
-                        bit = pattern_bits[pr, pc]
-                        color = black if bit == 0 else white
-
-                    x1 = c * cell_size
-                    y1 = r * cell_size
-                    x2 = x1 + cell_size
-                    y2 = y1 + cell_size
-
-                    tag_img[y1:y2, x1:x2] = color
-
-            # Resize cleanly to marker size
-            final_tag = cv2.resize(
-                tag_img,
-                (self.marker_size, self.marker_size),
-                interpolation=cv2.INTER_NEAREST
-            )
-
-            # Convert to BGR if needed
-            final_tag = cv2.cvtColor(final_tag, cv2.COLOR_GRAY2BGR)
-
-            return final_tag
-
+            half = polygon_size // 2
+            top_left = (center[0] - half, center[1] - half)
+            bottom_right = (center[0] + half, center[1] + half)
+            cv2.rectangle(marker, top_left, bottom_right, (0, 0, 0), -1)
+                
+            
+            # Add a thin black border around the entire marker for contrast
+            cv2.rectangle(marker, (0, 0), (self.marker_size-1, self.marker_size-1), (0, 0, 0), 1)
+            
+            return marker
+            
         except Exception as e:
-            self.get_logger().error(
-                f"Failed to generate tag {family} ID:{tag_id}: {e}"
-            )
-            return None
-        
+            self.get_logger().error(f"Failed to generate pattern for tag_id {tag_id}: {e}")
+            # Fallback: simple black square
+            fallback = np.zeros((self.marker_size, self.marker_size, 3), dtype=np.uint8)
+            cv2.rectangle(fallback, (5, 5), (self.marker_size-5, self.marker_size-5), (255, 255, 255), -1)
+            return fallback
     
     def get_fallback_pattern(self, intensity_quarter):
         """
@@ -924,14 +857,8 @@ class VisualAugmentor(Node):
         
     def get_marker_pattern(self, marker_id, landmark=None):
         """
-        Get or create AprilTag marker pattern with 10 total tags.
-        Maps 10 intensity levels to 10 specific tag patterns across 4 families.
-        
-        Tag Mapping (10 unique patterns):
-        - intensity 0-1: TAG16H5 IDs 0-1 (lowest intensity)
-        - intensity 2-3: TAG25H7 IDs 0-1
-        - intensity 4-5: TAG25H9 IDs 0-1
-        - intensity 6-9: TAG36H11 IDs 0-3 (highest intensity)
+        Get or create polygon marker pattern with 10 total tags.
+        Maps 10 intensity levels to 10 specific polygon patterns.
         """
         if marker_id not in self.marker_db:
             # Parse intensity from marker_id (format: "x_y_intensity_cluster")
@@ -940,34 +867,18 @@ class VisualAugmentor(Node):
                 try:
                     intensity_idx = int(parts[2])  # This is 0-9 from get_marker_id
                     
-                    # ========== 10-TAG MAPPING SYSTEM ==========
-                    # Map each intensity level (0-9) to a specific (family, tag_id)
-                    # This creates 10 distinct patterns with increasing complexity
-                    tag_mapping = {
-                        0: ('TAG16H5', 0),   # Lowest intensity - smallest tag
-                        1: ('TAG16H5', 1),
-                        2: ('TAG25H7', 0),
-                        3: ('TAG25H7', 1),
-                        4: ('TAG25H9', 0),
-                        5: ('TAG25H9', 1),
-                        6: ('TAG36H11', 0),
-                        7: ('TAG36H11', 1),
-                        8: ('TAG36H11', 2),
-                        9: ('TAG36H11', 3),   # Highest intensity - largest tag
-                    }
-                    
-                    # Select family and tag_id based on intensity_idx
-                    family, tag_id = tag_mapping[intensity_idx]
+                    # Use intensity_idx directly as tag_id (0-9)
+                    tag_id = intensity_idx
                     
                     # Cache key for this specific pattern
-                    cache_key = f"{family}_{tag_id}"
+                    cache_key = f"polygon_{tag_id}"
                     
                     # Calculate quarter for logging (0-3)
-                    if intensity_idx <= 1:
+                    if intensity_idx <= 2:
                         quarter = 0
-                    elif intensity_idx <= 3:
-                        quarter = 1
                     elif intensity_idx <= 5:
+                        quarter = 1
+                    elif intensity_idx <= 8:
                         quarter = 2
                     else:
                         quarter = 3
@@ -977,7 +888,7 @@ class VisualAugmentor(Node):
                         pattern = self.april_tag_cache[cache_key]
                     elif hasattr(self, 'april_tag_available') and self.april_tag_available:
                         # Generate on-the-fly if not in cache
-                        pattern = self.generate_single_april_tag(family, tag_id)
+                        pattern = self.generate_pattern("POLYGON", tag_id)
                         if pattern is not None:
                             self.april_tag_cache[cache_key] = pattern
                         else:
@@ -994,7 +905,7 @@ class VisualAugmentor(Node):
                             landmark, 
                             intensity_idx, 
                             quarter, 
-                            family, 
+                            f"polygon_{tag_id}", 
                             marker_id, 
                             intensity_normalized
                         )
@@ -1002,12 +913,12 @@ class VisualAugmentor(Node):
                     
                     self.get_logger().debug(
                         f"Marker ID: {marker_id} | Intensity: {intensity_idx} -> "
-                        f"Quarter: {quarter} | Family: {family} | Tag: {tag_id}",
+                        f"Quarter: {quarter} | Polygon: {tag_id}",
                         throttle_duration_sec=1.0
                     )
                     
                 except Exception as e:
-                    self.get_logger().warn(f"Error generating AprilTag: {e}, using fallback")
+                    self.get_logger().warn(f"Error generating polygon pattern: {e}, using fallback")
                     quarter = int(hashlib.md5(marker_id.encode()).hexdigest(), 16) % 4
                     pattern = self.get_fallback_pattern(quarter)
             else:
@@ -1023,7 +934,7 @@ class VisualAugmentor(Node):
                 oldest_key = next(iter(self.marker_db))
                 del self.marker_db[oldest_key]
         
-        return self.marker_db[marker_id]
+        return self.marker_db[marker_id]    
     
     def blend_marker(self, image, center_u, center_v, marker):
         """Blend marker pattern onto image at specified location and 70 pixels above."""
@@ -1150,3 +1061,147 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+
+
+
+
+        # def generate_pattern(self, family, tag_id):
+        # """
+        # Generate a simple pattern: white square with a black polygon inside.
+        
+        # Different polygons based on tag_id (0-9) for visual distinction:
+        # 0: Circle
+        # 1: Star (4-point)
+        # 2: Plus sign
+        # 3: Octagon
+        # 4: Hexagon
+        # 5: Diamond
+        # 6: Pentagon
+        # 7: Square
+        # 8: Triangle
+        # 9: Cross
+        # """
+        # try:
+        #     # Create white square background
+        #     marker = np.ones((self.marker_size, self.marker_size, 3), dtype=np.uint8) * 255
+            
+        #     # Calculate center and size
+        #     center = (self.marker_size // 2, self.marker_size // 2)
+        #     polygon_size = self.marker_size // 2  # Polygon takes 1/3 of marker size
+            
+        #     # Define polygon points based on tag_id
+        #     if tag_id == 0:  # Circle
+        #         cv2.circle(marker, center, polygon_size, (0, 0, 0), -1)
+                
+        #     elif tag_id == 7:  # Square
+        #         half = polygon_size // 2
+        #         top_left = (center[0] - half, center[1] - half)
+        #         bottom_right = (center[0] + half, center[1] + half)
+        #         cv2.rectangle(marker, top_left, bottom_right, (0, 0, 0), -1)
+                
+        #     elif tag_id == 8:  # Triangle (equilateral)
+        #         side = polygon_size
+        #         height = int(side * np.sqrt(3) / 2)
+        #         points = np.array([
+        #             [center[0], center[1] - height//2],
+        #             [center[0] - side//2, center[1] + height//2],
+        #             [center[0] + side//2, center[1] + height//2]
+        #         ], np.int32)
+        #         cv2.fillPoly(marker, [points], (0, 0, 0))
+                
+        #     elif tag_id == 5:  # Diamond (rotated square)
+        #         half = polygon_size // 2
+        #         points = np.array([
+        #             [center[0], center[1] - half],
+        #             [center[0] + half, center[1]],
+        #             [center[0], center[1] + half],
+        #             [center[0] - half, center[1]]
+        #         ], np.int32)
+        #         cv2.fillPoly(marker, [points], (0, 0, 0))
+                
+        #     elif tag_id == 6:  # Pentagon
+        #         radius = polygon_size * 0.7
+        #         points = []
+        #         for i in range(5):
+        #             angle = -90 + i * 72  # Start from top
+        #             rad = np.deg2rad(angle)
+        #             x = center[0] + int(radius * np.cos(rad))
+        #             y = center[1] + int(radius * np.sin(rad))
+        #             points.append([x, y])
+        #         cv2.fillPoly(marker, [np.array(points, np.int32)], (0, 0, 0))
+                
+        #     elif tag_id == 4:  # Hexagon
+        #         radius = polygon_size * 0.8
+        #         points = []
+        #         for i in range(6):
+        #             angle = i * 60
+        #             rad = np.deg2rad(angle)
+        #             x = center[0] + int(radius * np.cos(rad))
+        #             y = center[1] + int(radius * np.sin(rad))
+        #             points.append([x, y])
+        #         cv2.fillPoly(marker, [np.array(points, np.int32)], (0, 0, 0))
+                
+        #     elif tag_id == 1:  # 4-point Star
+        #         outer_radius = polygon_size
+        #         inner_radius = polygon_size // 2
+        #         points = []
+        #         for i in range(8):
+        #             angle = i * 45
+        #             rad = np.deg2rad(angle)
+        #             radius = outer_radius if i % 2 == 0 else inner_radius
+        #             x = center[0] + int(radius * np.cos(rad))
+        #             y = center[1] + int(radius * np.sin(rad))
+        #             points.append([x, y])
+        #         cv2.fillPoly(marker, [np.array(points, np.int32)], (0, 0, 0))
+                
+        #     elif tag_id == 9:  # Cross (thick)
+        #         thickness = polygon_size // 3
+        #         half_h = polygon_size // 2
+        #         # Vertical bar
+        #         cv2.rectangle(marker, 
+        #                     (center[0] - thickness//2, center[1] - half_h),
+        #                     (center[0] + thickness//2, center[1] + half_h),
+        #                     (0, 0, 0), -1)
+        #         # Horizontal bar
+        #         cv2.rectangle(marker,
+        #                     (center[0] - half_h, center[1] - thickness//2),
+        #                     (center[0] + half_h, center[1] + thickness//2),
+        #                     (0, 0, 0), -1)
+                            
+        #     elif tag_id == 2:  # Plus sign (similar to cross but thinner)
+        #         thickness = polygon_size // 4
+        #         half_h = polygon_size // 2
+        #         # Vertical bar
+        #         cv2.rectangle(marker, 
+        #                     (center[0] - thickness//2, center[1] - half_h),
+        #                     (center[0] + thickness//2, center[1] + half_h),
+        #                     (0, 0, 0), -1)
+        #         # Horizontal bar
+        #         cv2.rectangle(marker,
+        #                     (center[0] - half_h, center[1] - thickness//2),
+        #                     (center[0] + half_h, center[1] + thickness//2),
+        #                     (0, 0, 0), -1)
+                            
+        #     elif tag_id == 3:  # Octagon
+        #         radius = polygon_size
+        #         points = []
+        #         for i in range(8):
+        #             angle = i * 45
+        #             rad = np.deg2rad(angle)
+        #             x = center[0] + int(radius * np.cos(rad))
+        #             y = center[1] + int(radius * np.sin(rad))
+        #             points.append([x, y])
+        #         cv2.fillPoly(marker, [np.array(points, np.int32)], (0, 0, 0))
+            
+        #     # Add a thin black border around the entire marker for contrast
+        #     cv2.rectangle(marker, (0, 0), (self.marker_size-1, self.marker_size-1), (0, 0, 0), 1)
+            
+        #     return marker
+            
+        # except Exception as e:
+        #     self.get_logger().error(f"Failed to generate pattern for tag_id {tag_id}: {e}")
+        #     # Fallback: simple black square
+        #     fallback = np.zeros((self.marker_size, self.marker_size, 3), dtype=np.uint8)
+        #     cv2.rectangle(fallback, (5, 5), (self.marker_size-5, self.marker_size-5), (255, 255, 255), -1)
+        #     return fallback
+    
