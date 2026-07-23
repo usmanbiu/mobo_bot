@@ -36,7 +36,7 @@ def generate_launch_description():
   map_path = PathJoinSubstitution([
           navigation_pkg_path,
           "maps",
-          PythonExpression(expression=["'", world_name, "'", " + '.yaml'"])
+          PythonExpression(expression=["'", "room_with_walls", "'", " + '.yaml'"])
       ]
   )
 

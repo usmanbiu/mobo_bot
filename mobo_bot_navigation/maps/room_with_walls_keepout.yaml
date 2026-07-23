@@ -1,4 +1,4 @@
-image: room_with_walls.pgm
+image: room_with_walls_keepout.pgm
 mode: trinary
 resolution: 0.050
 origin: [-3.536, -4.915, 0]

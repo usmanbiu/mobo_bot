@@ -1,0 +1,5 @@
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <FollowObject name="FollowPerson" pose_topic="/person_pose" max_duration="0.0"/>
+  </BehaviorTree>
+</root>

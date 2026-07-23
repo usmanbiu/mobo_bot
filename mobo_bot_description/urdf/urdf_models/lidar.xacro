@@ -5,7 +5,7 @@
         <joint name="${base_name}_joint" type="fixed">
             <parent link="${parent_name}"/>
             <child link="${base_name}"/>
-            <origin xyz="${x} ${y} ${z}" rpy="0 0 ${pi}"/>  <!-- change yaw to 0 for simulation -->
+            <origin xyz="${x} ${y} ${z}" rpy="0 0 0"/>  <!-- change yaw to 0 for simulation -->
         </joint>
 
         <link name="${base_name}">
