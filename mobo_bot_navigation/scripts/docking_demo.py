@@ -23,7 +23,7 @@ from nav2_msgs.action import DockRobot, UndockRobot
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
-from tf_transformations import quaternion_from_euler
+from tf_transformations import euler_from_quaternion, quaternion_from_euler
 
 class TaskResult(Enum):
     UNKNOWN = 0
@@ -41,19 +41,41 @@ class DockingTester(Node):
         self.status = None
         self.feedback = None
 
-       # self.tracked_dock_pose = None
+        self.tracked_dock_pose = None
 
         self.docking_client = ActionClient(self, DockRobot,
                                             'dock_robot')
         self.undocking_client = ActionClient(self, UndockRobot,
                                             'undock_robot')
         
+    #Attemp to use tracked pose directly from the camera, uncommment to subscribe to tracked pose
+
     #     self.dock_pose = self.create_subscription(
-    #         PoseStamped, 'detected_dock_pose', self.dock_callback, 10)
+    #          PoseStamped, 'detected_dock_pose', self.dock_callback, 10)
 
     # def dock_callback(self, msg):
-    #     print("Received dock pose: " + str(msg))
-    #     self.tracked_dock_pose = msg
+    #      print("Received dock pose: " + str(msg))
+    #      self.tracked_dock_pose = msg
+
+
+    def rotate_pose_yaw(self, pose_msg, yaw_offset_rad):
+        # Get current orientation as Euler angles
+        q = [pose_msg.pose.orientation.x,
+            pose_msg.pose.orientation.y,
+            pose_msg.pose.orientation.z,
+            pose_msg.pose.orientation.w]
+        roll, pitch, yaw = euler_from_quaternion(q)
+        
+        # Add the offset
+        new_yaw = yaw + yaw_offset_rad
+        
+        # Convert back to quaternion
+        new_q = quaternion_from_euler(roll, pitch, new_yaw)
+        pose_msg.pose.orientation.x = new_q[0]
+        pose_msg.pose.orientation.y = new_q[1]
+        pose_msg.pose.orientation.z = new_q[2]
+        pose_msg.pose.orientation.w = new_q[3]
+        return pose_msg
     
             
 
@@ -192,21 +214,30 @@ def main():
     while True:
         time.sleep(1)
 
-        # set dock pose
+        # # set dock pose
         dock_pose = PoseStamped()
         dock_pose.header.stamp = tester.get_clock().now().to_msg()
         dock_pose.header.frame_id = "map"
         dock_pose.pose.position.x = -0.2
-        dock_pose.pose.position.y = 4.0
-        tester.dockRobot(dock_pose)
+        dock_pose.pose.position.y = 3.0
+        
 
-        # Set the yaw angle (in radians). For example, 90° = π/2 ≈ 1.5708
-        yaw_rad = 1.5708  # 90 degrees anti clockwise
-        q = quaternion_from_euler(0.0, 0.0, yaw_rad)  # roll, pitch, yaw
-        dock_pose.pose.orientation.x = q[0]
-        dock_pose.pose.orientation.y = q[1]
-        dock_pose.pose.orientation.z = q[2]
-        dock_pose.pose.orientation.w = q[3]
+        # # Set the yaw angle (in radians). For example, 90° = π/2 ≈ 1.5708
+        yaw_rad = 1.57  # 90 degrees anti clockwise
+        dock_pose = tester.rotate_pose_yaw(dock_pose, yaw_rad)  # Rotate by yaw_rad radians 
+
+
+        #Attemp to use tracked pose directly from the camera, Wait for the first tracked pose
+        # print("Waiting for dock pose on topic 'detected_dock_pose'...")
+        # while tester.tracked_dock_pose is None:
+        #     rclpy.spin_once(tester, timeout_sec=0.1)
+        # print("Received dock pose, proceeding with docking.")
+
+        # ---- Dock ----
+        # dock_pose = tester.tracked_dock_pose
+        # print(tester.tracked_dock_pose.header.frame_id)
+        #dock_pose = tester.rotate_pose_yaw(dock_pose, yaw_rad)  # Rota
+        
 
         dock_id = 'flex_dock1'
         
